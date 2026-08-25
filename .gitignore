@@ -1,0 +1,39 @@
+# Credentials and local authorization state
+.env
+.env.*
+agent/.env
+agent/auth.json
+agent/trust.json
+agent/*token*
+auth-*.token
+
+# Conversations, databases, and runtime state
+agent/sessions/
+agent/terminal-sessions/
+agent/cache/
+agent/*.db
+agent/*.db-*
+agent/*.db-shm
+agent/*.db-wal
+agent/last-changelog-version
+logs/
+run/
+cache/
+collab/
+wt/
+install-id
+gpu_cache.json
+
+# Installed plugins, packages, and generated dependencies
+plugins/
+node_modules/
+agent/node_modules/
+agent/extensions/**/node_modules/
+
+# Backups, temporary files, and editor state
+*.bak
+*.backup
+*.tmp
+.DS_Store
+*.swp
+*~

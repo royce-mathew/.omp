@@ -1,0 +1,17 @@
+setupVersion: 2
+symbolPreset: nerd
+colorBlindMode: false
+theme: 
+  dark: oxocarbon
+  light: light
+statusLine: 
+  preset: default
+  separator: powerline-thin
+  sessionAccent: true
+  transparent: true
+display: 
+  showTokenUsage: true
+  cacheMissMarker: true
+  shimmer: kitt
+secrets: 
+  enabled: true
