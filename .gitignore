@@ -1,6 +1,7 @@
 # Credentials and local authorization state
 .env
 .env.*
+*.key
 agent/.env
 agent/auth.json
 agent/trust.json
@@ -16,6 +17,7 @@ agent/*.db-*
 agent/*.db-shm
 agent/*.db-wal
 agent/last-changelog-version
+agent/config.yml
 logs/
 run/
 cache/
