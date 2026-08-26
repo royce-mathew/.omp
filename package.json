@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "test:sandbox": "bun test agent/extensions/sandbox/tests",
+    "test:undo-redo": "bun test agent/extensions/undo-redo/tests",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
