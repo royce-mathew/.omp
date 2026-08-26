@@ -32,6 +32,7 @@ plugins/
 node_modules/
 agent/node_modules/
 agent/extensions/**/node_modules/
+agent/extensions/undo-redo/.data/
 
 # Backups, temporary files, and editor state
 *.bak
