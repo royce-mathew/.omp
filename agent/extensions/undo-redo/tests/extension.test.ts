@@ -187,7 +187,7 @@ describe("local undo redo extension", () => {
         .some(
           (entry) =>
             entry.type === "custom" &&
-            entry.customType === "omp.undo-redo.turn",
+            entry.customType === "omp.undo-redo.checkpoint.v2",
         ),
     ).toBe(true);
 
@@ -231,10 +231,10 @@ describe("local undo redo extension", () => {
         if (sessionFile) await manager.setSessionFile(sessionFile);
       },
     } as unknown as ExtensionCommandContext;
-
     await extension.commands.get("undo")?.("", commandContext);
+
     expect(notifications).toContainEqual([
-      "Undid last user turn and restored workspace.",
+      "Undid last user turn and restored selected workspace paths.",
       "info",
     ]);
     expect(await Bun.file(path.join(root, "tracked.txt")).text()).toBe(
@@ -265,7 +265,7 @@ describe("local undo redo extension", () => {
     );
     expect(manager.getEntry(userEntryId)).toBeDefined();
     expect(notifications).toContainEqual([
-      "Redid user turn and restored workspace.",
+      "Redid user turn and restored selected workspace paths.",
       "info",
     ]);
   });
@@ -335,7 +335,7 @@ describe("local undo redo extension", () => {
     );
     expect(editor).toBe("/undo");
     expect(
-      warnings.some((message) => message.includes("Workspace changed")),
+      warnings.some((message) => message.includes("Affected workspace paths changed")),
     ).toBe(true);
   });
 
@@ -343,7 +343,7 @@ describe("local undo redo extension", () => {
     const root = await makeRepository();
     const linked = `${root}-linked`;
     cleanup.push(linked);
-    await $`git worktree add --detach ${linked}`.cwd(root).quiet();
+    await $`git worktree add -b undo-redo-linked ${linked}`.cwd(root).quiet();
 
     const workspace = new WorkspaceHistory(
       { exec } as unknown as ExtensionAPI,
@@ -364,7 +364,13 @@ describe("local undo redo extension", () => {
 
     await Bun.write(path.join(root, "tracked.txt"), "main changed\n");
     await Bun.write(path.join(linked, "tracked.txt"), "linked changed\n");
-    await workspace.restoreAll(snapshots);
+    const after = await workspace.capture(
+      [root, linked],
+      "session",
+      "turn",
+      "after",
+    );
+    await workspace.restoreAllPaths(await workspace.deltas(snapshots, after), "before");
 
     expect(await Bun.file(path.join(root, "tracked.txt")).text()).toBe(
       "baseline\n",
@@ -372,5 +378,43 @@ describe("local undo redo extension", () => {
     expect(await Bun.file(path.join(linked, "tracked.txt")).text()).toBe(
       "baseline\n",
     );
+
+  });
+  it("restores only turn paths while preserving unrelated manual edits", async () => {
+    const root = await makeRepository();
+    const workspace = new WorkspaceHistory(
+      { exec } as unknown as ExtensionAPI,
+      dataDirectory(root),
+    );
+    const before = await workspace.capture([root], "session", "selective", "before");
+    await Bun.write(path.join(root, "tracked.txt"), "turn change\n");
+    const after = await workspace.capture([root], "session", "selective", "after");
+    const deltas = await workspace.deltas(before, after);
+    await Bun.write(path.join(root, "manual.txt"), "manual change\n");
+
+    await workspace.restoreAllPaths(deltas, "before");
+
+    expect(await Bun.file(path.join(root, "tracked.txt")).text()).toBe("baseline\n");
+    expect(await Bun.file(path.join(root, "manual.txt")).text()).toBe("manual change\n");
+  });
+
+  it("round-trips file-to-directory changes through selective restoration", async () => {
+    const root = await makeRepository();
+    const workspace = new WorkspaceHistory(
+      { exec } as unknown as ExtensionAPI,
+      dataDirectory(root),
+    );
+    const before = await workspace.capture([root], "session", "shape", "before");
+    await fs.rm(path.join(root, "tracked.txt"));
+    await fs.mkdir(path.join(root, "tracked.txt"));
+    await Bun.write(path.join(root, "tracked.txt", "child.txt"), "child\n");
+    const after = await workspace.capture([root], "session", "shape", "after");
+    const deltas = await workspace.deltas(before, after);
+
+    await workspace.restoreAllPaths(deltas, "before");
+    expect(await Bun.file(path.join(root, "tracked.txt")).text()).toBe("baseline\n");
+
+    await workspace.restoreAllPaths(deltas, "after");
+    expect(await Bun.file(path.join(root, "tracked.txt", "child.txt")).text()).toBe("child\n");
   });
 });

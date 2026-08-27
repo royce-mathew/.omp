@@ -1,9 +1,12 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { WorkspaceDelta } from "./state.ts";
 
 const GIT_TIMEOUT_MS = 5 * 60 * 1000;
 const PRIVATE_REF_PREFIX = "refs/omp/undo/";
+export const MAX_UNTRACKED_FILE_BYTES = 2 * 1024 * 1024;
+export const MAX_TURN_PRIVATE_BYTES = 32 * 1024 * 1024;
 const lockChains = new Map<string, Promise<unknown>>();
 
 export interface WorkspaceSnapshot {
@@ -13,16 +16,23 @@ export interface WorkspaceSnapshot {
   indexTree: string;
   worktreeTree: string;
   refName: string;
+  scopes: string[];
+  excludedPaths: string[];
 }
 
 export type SnapshotMatch =
-  { matches: true } | { matches: false; paths: string[] };
+  | { matches: true }
+  | { matches: false; paths: string[] };
+
+interface Repository {
+  repositoryRoot: string;
+  commonDir: string;
+  head: string;
+  scopes: string[];
+}
 
 export type ResolvedWorkspace =
-  | {
-      ok: true;
-      repositories: Array<{ repositoryRoot: string; commonDir: string }>;
-    }
+  | { ok: true; repositories: Repository[] }
   | { ok: false; root: string; message: string };
 
 function repositoryHash(commonDir: string): string {
@@ -48,6 +58,17 @@ function validateRef(refName: string): void {
   }
 }
 
+function validatePath(relativePath: string): void {
+  if (
+    !relativePath ||
+    path.isAbsolute(relativePath) ||
+    relativePath.split("/").includes("..") ||
+    relativePath.includes("\0")
+  ) {
+    throw new Error(`Invalid workspace path: ${relativePath}`);
+  }
+}
+
 async function run(
   pi: ExtensionAPI,
   cwd: string,
@@ -55,21 +76,18 @@ async function run(
   env: Record<string, string> = {},
   allowFailure = false,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
-  const pinnedEnv: Record<string, string> = {
-    GIT_TERMINAL_PROMPT: "0",
-    GCM_INTERACTIVE: "Never",
-    GIT_PAGER: "cat",
-    ...env,
-  };
-  const commandArgs = [
-    ...Object.entries(pinnedEnv).map(([key, value]) => `${key}=${value}`),
-    "git",
-    ...args,
-  ];
-  const result = await pi.exec("env", commandArgs, {
-    cwd,
-    timeout: GIT_TIMEOUT_MS,
-  });
+  const result = await pi.exec(
+    "env",
+    [
+      "GIT_TERMINAL_PROMPT=0",
+      "GCM_INTERACTIVE=Never",
+      "GIT_PAGER=cat",
+      ...Object.entries(env).map(([key, value]) => `${key}=${value}`),
+      "git",
+      ...args,
+    ],
+    { cwd, timeout: GIT_TIMEOUT_MS },
+  );
   if (!allowFailure && result.code !== 0) {
     throw new Error(
       result.stderr.trim() ||
@@ -96,12 +114,10 @@ async function withLock<T>(
   const key = await fs.realpath(commonDir);
   const prior = lockChains.get(key);
   const current = (async () => {
-    if (prior) {
-      try {
-        await prior;
-      } catch {
-        // A failed operation must not poison the repository queue.
-      }
+    try {
+      await prior;
+    } catch {
+      // Failed work must not poison later operations.
     }
     return operation();
   })();
@@ -116,7 +132,7 @@ async function withLock<T>(
 async function resolveRepository(
   pi: ExtensionAPI,
   configuredRoot: string,
-): Promise<{ repositoryRoot: string; commonDir: string; head: string } | null> {
+): Promise<Omit<Repository, "scopes"> | null> {
   const root = path.resolve(configuredRoot);
   const topLevel = await run(
     pi,
@@ -127,31 +143,35 @@ async function resolveRepository(
   );
   if (topLevel.code !== 0) return null;
   const repositoryRoot = path.resolve(topLevel.stdout.trim());
-  const common = await text(pi, repositoryRoot, [
-    "rev-parse",
-    "--path-format=absolute",
-    "--git-common-dir",
-  ]);
-  const commonDir = await fs.realpath(common.trim());
-  const headResult = await run(
+  const commonDir = await fs.realpath(
+    (
+      await text(pi, repositoryRoot, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+      ])
+    ).trim(),
+  );
+  const symbolicHead = await run(
     pi,
     repositoryRoot,
-    ["rev-parse", "HEAD"],
+    ["symbolic-ref", "-q", "HEAD"],
     {},
     true,
   );
-  const head = headResult.code === 0 ? headResult.stdout.trim() : "";
-  return head ? { repositoryRoot, commonDir, head } : null;
+  if (symbolicHead.code !== 0) return null;
+  const head = await run(pi, repositoryRoot, ["rev-parse", "HEAD"], {}, true);
+  const headState = head.code === 0 && head.stdout.trim()
+    ? head.stdout.trim()
+    : `unborn:${symbolicHead.stdout.trim()}`;
+  return { repositoryRoot, commonDir, head: headState };
 }
 
 export async function resolveWorkspace(
   pi: ExtensionAPI,
   roots: readonly string[],
 ): Promise<ResolvedWorkspace> {
-  const repositories = new Map<
-    string,
-    { repositoryRoot: string; commonDir: string }
-  >();
+  const repositories = new Map<string, Repository>();
   for (const configuredRoot of roots) {
     const root = path.resolve(configuredRoot);
     const repository = await resolveRepository(pi, root);
@@ -159,14 +179,33 @@ export async function resolveWorkspace(
       return {
         ok: false,
         root,
-        message: `Workspace root is not in a Git repository with a HEAD: ${root}`,
+        message: `Workspace root is not in a supported Git repository: ${root}`,
       };
     }
-    if (!repositories.has(repository.repositoryRoot)) {
-      repositories.set(repository.repositoryRoot, {
-        repositoryRoot: repository.repositoryRoot,
-        commonDir: repository.commonDir,
-      });
+    const relative = path.relative(repository.repositoryRoot, root);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      return { ok: false, root, message: `Workspace root escapes its repository: ${root}` };
+    }
+    const scope = relative ? relative.split(path.sep).join("/") : ".";
+    const key = `${repository.repositoryRoot}\0${repository.commonDir}`;
+    const existing = repositories.get(key);
+    if (existing) {
+      if (!existing.scopes.includes(scope)) existing.scopes.push(scope);
+    } else {
+      repositories.set(key, { ...repository, scopes: [scope] });
+    }
+  }
+  for (const repository of repositories.values()) {
+    repository.scopes.sort();
+    if (repository.scopes.includes(".")) repository.scopes = ["."];
+    else {
+      repository.scopes = repository.scopes.filter(
+        (scope, index, all) =>
+          !all.some(
+            (parent, parentIndex) =>
+              parentIndex !== index && scope.startsWith(`${parent}/`),
+          ),
+      );
     }
   }
   return { ok: true, repositories: [...repositories.values()] };
@@ -175,14 +214,13 @@ export async function resolveWorkspace(
 async function ensureStore(
   pi: ExtensionAPI,
   dataDir: string,
-  repository: { repositoryRoot: string; commonDir: string },
+  repository: Pick<Repository, "repositoryRoot" | "commonDir">,
 ): Promise<string> {
   const store = storePath(dataDir, repository.commonDir);
   if (!(await Bun.file(path.join(store, "HEAD")).exists())) {
     await fs.mkdir(path.dirname(store), { recursive: true });
     await run(pi, path.dirname(store), ["init", "--bare", store]);
   }
-
   const alternatesPath = path.join(store, "objects", "info", "alternates");
   const sourceObjects = await fs.realpath(
     path.join(repository.commonDir, "objects"),
@@ -193,10 +231,12 @@ async function ensureStore(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  const alternates = existing.split("\n").filter(Boolean);
-  if (!alternates.includes(sourceObjects)) {
-    alternates.push(sourceObjects);
-    await Bun.write(alternatesPath, `${alternates.join("\n")}\n`);
+  if (!existing.split("\n").filter(Boolean).includes(sourceObjects)) {
+    await fs.mkdir(path.dirname(alternatesPath), { recursive: true });
+    await Bun.write(
+      alternatesPath,
+      `${[...existing.split("\n").filter(Boolean), sourceObjects].join("\n")}\n`,
+    );
   }
   return store;
 }
@@ -218,68 +258,71 @@ async function refExists(
   store: string,
   refName: string,
 ): Promise<boolean> {
-  const result = await run(
-    pi,
-    store,
-    ["--git-dir", store, "show-ref", "--verify", "--quiet", refName],
-    {},
-    true,
+  return (
+    await run(
+      pi,
+      store,
+      ["--git-dir", store, "show-ref", "--verify", "--quiet", refName],
+      {},
+      true,
+    )
+  ).code === 0;
+}
+
+function parseNul(raw: string): string[] {
+  return raw.split("\0").filter(Boolean);
+}
+
+async function oversizedUntracked(
+  pi: ExtensionAPI,
+  repository: Repository,
+): Promise<string[]> {
+  const candidates = parseNul(
+    await text(pi, repository.repositoryRoot, [
+      "ls-files",
+      "--others",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ...repository.scopes,
+    ]),
   );
-  return result.code === 0;
+  const excluded: string[] = [];
+  for (const candidate of candidates) {
+    validatePath(candidate);
+    const stat = await fs.lstat(path.join(repository.repositoryRoot, candidate));
+    if (stat.isFile() && stat.size > MAX_UNTRACKED_FILE_BYTES) excluded.push(candidate);
+  }
+  return excluded.sort();
 }
 
 async function captureFingerprint(
   pi: ExtensionAPI,
   dataDir: string,
-  repository: { repositoryRoot: string; commonDir: string },
+  repository: Repository,
   refName?: string,
 ): Promise<WorkspaceSnapshot> {
-  const headResult = await run(
-    pi,
-    repository.repositoryRoot,
-    ["rev-parse", "HEAD"],
-    {},
-    true,
-  );
-  if (headResult.code !== 0 || !headResult.stdout.trim()) {
-    throw new Error(`Git repository has no HEAD: ${repository.repositoryRoot}`);
-  }
-  const head = headResult.stdout.trim();
   const store = await ensureStore(pi, dataDir, repository);
-  const indexTree = (
-    await text(pi, repository.repositoryRoot, ["write-tree"])
-  ).trim();
+  const indexTree = (await text(pi, repository.repositoryRoot, ["write-tree"])).trim();
   const indexFile = path.join(store, `index-${crypto.randomUUID()}`);
   const env = privateEnv(store, repository.repositoryRoot, indexFile);
   try {
     await run(pi, repository.repositoryRoot, ["read-tree", indexTree], env);
-    const sourceExclude = path.join(repository.commonDir, "info", "exclude");
-    const privateExclude = path.join(store, "info", "exclude");
-    try {
-      await fs.copyFile(sourceExclude, privateExclude);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      await fs.rm(privateExclude, { force: true });
-    }
-    const globalExclude = await run(
+    const excludedPaths = await oversizedUntracked(pi, repository);
+    await run(
       pi,
       repository.repositoryRoot,
-      ["config", "--path", "--get", "core.excludesFile"],
-      {},
-      true,
+      ["add", "-A", "--", ...repository.scopes],
+      env,
     );
-    const addArgs =
-      globalExclude.code === 0 && globalExclude.stdout.trim()
-        ? [
-            "-c",
-            `core.excludesFile=${globalExclude.stdout.trim()}`,
-            "add",
-            "-A",
-            "--",
-            ".",
-          ]
-        : ["add", "-A", "--", "."];
-    await run(pi, repository.repositoryRoot, addArgs, env);
+    for (const excluded of excludedPaths) {
+      await run(
+        pi,
+        repository.repositoryRoot,
+        ["update-index", "--force-remove", "--", excluded],
+        env,
+      );
+    }
     const worktreeTree = (
       await text(pi, repository.repositoryRoot, ["write-tree"], env)
     ).trim();
@@ -287,13 +330,7 @@ async function captureFingerprint(
       refName ?? `${PRIVATE_REF_PREFIX}unreferenced/${crypto.randomUUID()}`;
     if (refName) {
       validateRef(refName);
-      await run(pi, store, [
-        "--git-dir",
-        store,
-        "update-ref",
-        refName,
-        worktreeTree,
-      ]);
+      await run(pi, store, ["--git-dir", store, "update-ref", refName, worktreeTree]);
       await run(pi, store, [
         "--git-dir",
         store,
@@ -305,10 +342,12 @@ async function captureFingerprint(
     return {
       repositoryRoot: repository.repositoryRoot,
       commonDir: repository.commonDir,
-      head,
+      head: repository.head,
       indexTree,
       worktreeTree,
       refName: snapshotRef,
+      scopes: [...repository.scopes],
+      excludedPaths,
     };
   } finally {
     await fs.rm(indexFile, { force: true });
@@ -338,18 +377,49 @@ async function treeDifference(
   root: string,
   expected: string,
   actual: string,
-  filter?: string,
+  scopes: readonly string[],
 ): Promise<string[]> {
-  const args = [
-    "--git-dir",
-    store,
-    "diff-tree",
-    "--no-commit-id",
-    "--name-status",
-  ];
-  if (filter) args.push(`--diff-filter=${filter}`);
-  args.push("-r", "-z", expected, actual);
-  return parseNameStatus(await text(pi, root, args));
+  return parseNameStatus(
+    await text(pi, root, [
+      "--git-dir",
+      store,
+      "diff-tree",
+      "--no-commit-id",
+      "--name-status",
+      "-r",
+      "-z",
+      expected,
+      actual,
+      "--",
+      ...scopes,
+    ]),
+  );
+}
+
+function matchingRepository(
+  snapshots: readonly WorkspaceSnapshot[],
+  candidate: WorkspaceSnapshot,
+): WorkspaceSnapshot | undefined {
+  return snapshots.find(
+    (snapshot) =>
+      snapshot.repositoryRoot === candidate.repositoryRoot &&
+      snapshot.commonDir === candidate.commonDir,
+  );
+}
+
+interface TreeEntry {
+  mode: string;
+  object: string;
+  path: string;
+}
+
+function parseTreeEntry(raw: string): TreeEntry | undefined {
+  const tab = raw.indexOf("\t");
+  if (tab < 0) return undefined;
+  const [mode, type, object] = raw.slice(0, tab).split(" ");
+  return type === "blob" && mode && object
+    ? { mode, object, path: raw.slice(tab + 1) }
+    : undefined;
 }
 
 export class WorkspaceHistory {
@@ -362,7 +432,7 @@ export class WorkspaceHistory {
     roots: readonly string[],
     rootSessionId: string,
     turnId: string,
-    stage: "before" | "after",
+    stage: "before" | "after" | "rollback" = "before",
   ): Promise<WorkspaceSnapshot[]> {
     const resolved = await resolveWorkspace(this.pi, roots);
     if (!resolved.ok) throw new Error(resolved.message);
@@ -376,10 +446,11 @@ export class WorkspaceHistory {
           stage,
           Bun.hash.wyhash(repository.repositoryRoot).toString(16),
         ].join("/");
-        const snapshot = await withLock(repository.commonDir, () =>
-          captureFingerprint(this.pi, this.dataDir, repository, refName),
+        snapshots.push(
+          await withLock(repository.commonDir, () =>
+            captureFingerprint(this.pi, this.dataDir, repository, refName),
+          ),
         );
-        snapshots.push(snapshot);
       }
       return snapshots;
     } catch (error) {
@@ -388,14 +459,74 @@ export class WorkspaceHistory {
     }
   }
 
-  async matches(snapshot: WorkspaceSnapshot): Promise<SnapshotMatch> {
-    const repository = await resolveRepository(
-      this.pi,
-      snapshot.repositoryRoot,
-    );
-    if (!repository || repository.commonDir !== snapshot.commonDir) {
+  async deltas(
+    before: readonly WorkspaceSnapshot[],
+    after: readonly WorkspaceSnapshot[],
+  ): Promise<WorkspaceDelta[]> {
+    if (before.length !== after.length) throw new Error("Workspace roots changed during the user turn.");
+    const deltas: WorkspaceDelta[] = [];
+    for (const beforeSnapshot of before) {
+      const afterSnapshot = matchingRepository(after, beforeSnapshot);
+      if (
+        !afterSnapshot ||
+        beforeSnapshot.scopes.length !== afterSnapshot.scopes.length ||
+        beforeSnapshot.scopes.some(
+          (scope, index) => scope !== afterSnapshot.scopes[index],
+        )
+      ) {
+        throw new Error("Workspace roots changed during the user turn.");
+      }
+      const store = storePath(this.dataDir, beforeSnapshot.commonDir);
+      const changedPaths = new Set<string>([
+        ...(await treeDifference(
+          this.pi,
+          store,
+          beforeSnapshot.repositoryRoot,
+          beforeSnapshot.indexTree,
+          afterSnapshot.indexTree,
+          beforeSnapshot.scopes,
+        )),
+        ...(await treeDifference(
+          this.pi,
+          store,
+          beforeSnapshot.repositoryRoot,
+          beforeSnapshot.worktreeTree,
+          afterSnapshot.worktreeTree,
+          beforeSnapshot.scopes,
+        )),
+      ]);
+      for (const excludedPath of new Set([
+        ...beforeSnapshot.excludedPaths,
+        ...afterSnapshot.excludedPaths,
+      ])) {
+        changedPaths.delete(excludedPath);
+      }
+      for (const changedPath of changedPaths) validatePath(changedPath);
+      deltas.push({
+        repositoryRoot: beforeSnapshot.repositoryRoot,
+        commonDir: beforeSnapshot.commonDir,
+        before: beforeSnapshot,
+        after: afterSnapshot,
+        changedPaths: [...changedPaths].sort(),
+      });
+    }
+    return deltas;
+  }
+
+  async matchPaths(
+    snapshot: WorkspaceSnapshot,
+    changedPaths: readonly string[],
+    expectedHead = snapshot.head,
+  ): Promise<SnapshotMatch> {
+    const repository = await resolveRepository(this.pi, snapshot.repositoryRoot);
+    if (
+      !repository ||
+      repository.commonDir !== snapshot.commonDir ||
+      repository.head !== expectedHead
+    ) {
       return { matches: false, paths: [snapshot.repositoryRoot] };
     }
+    for (const changedPath of changedPaths) validatePath(changedPath);
     return withLock(repository.commonDir, async () => {
       const store = storePath(this.dataDir, repository.commonDir);
       if (
@@ -404,61 +535,70 @@ export class WorkspaceHistory {
       ) {
         return { matches: false, paths: [snapshot.refName] };
       }
-      const current = await captureFingerprint(
-        this.pi,
-        this.dataDir,
-        repository,
-      );
-      if (
-        current.head === snapshot.head &&
-        current.indexTree === snapshot.indexTree &&
-        current.worktreeTree === snapshot.worktreeTree
-      ) {
-        return { matches: true };
-      }
-      const paths =
-        current.worktreeTree === snapshot.worktreeTree
-          ? [repository.repositoryRoot]
-          : await treeDifference(
-              this.pi,
-              store,
-              repository.repositoryRoot,
-              snapshot.worktreeTree,
-              current.worktreeTree,
-            );
-      return { matches: false, paths };
+      const current = await captureFingerprint(this.pi, this.dataDir, {
+        ...repository,
+        scopes: snapshot.scopes,
+      });
+      const paths = new Set<string>([
+        ...(await treeDifference(
+          this.pi,
+          store,
+          repository.repositoryRoot,
+          snapshot.indexTree,
+          current.indexTree,
+          changedPaths,
+        )),
+        ...(await treeDifference(
+          this.pi,
+          store,
+          repository.repositoryRoot,
+          snapshot.worktreeTree,
+          current.worktreeTree,
+          changedPaths,
+        )),
+      ]);
+      return paths.size === 0
+        ? { matches: true }
+        : { matches: false, paths: [...paths].sort() };
     });
   }
 
-  async matchAll(
-    snapshots: readonly WorkspaceSnapshot[],
+  async matchAllPaths(
+    workspaces: readonly WorkspaceDelta[],
+    side: "before" | "after",
+    expectedHeads: ReadonlyMap<string, string>,
   ): Promise<SnapshotMatch> {
-    const changed = new Set<string>();
-    for (const snapshot of snapshots) {
-      const result = await this.matches(snapshot);
+    const paths = new Set<string>();
+    for (const workspace of workspaces) {
+      const result = await this.matchPaths(
+        workspace[side],
+        workspace.changedPaths,
+        expectedHeads.get(workspace.commonDir),
+      );
       if (!result.matches) {
         for (const changedPath of result.paths) {
-          changed.add(
+          paths.add(
             path.isAbsolute(changedPath)
               ? changedPath
-              : path.join(snapshot.repositoryRoot, changedPath),
+              : path.join(workspace.repositoryRoot, changedPath),
           );
         }
       }
     }
-    return changed.size === 0
+    return paths.size === 0
       ? { matches: true }
-      : { matches: false, paths: [...changed] };
+      : { matches: false, paths: [...paths].sort() };
   }
 
-  async restore(snapshot: WorkspaceSnapshot): Promise<void> {
-    const repository = await resolveRepository(
-      this.pi,
-      snapshot.repositoryRoot,
-    );
+  async restorePaths(
+    snapshot: WorkspaceSnapshot,
+    changedPaths: readonly string[],
+  ): Promise<void> {
+    const repository = await resolveRepository(this.pi, snapshot.repositoryRoot);
     if (!repository || repository.commonDir !== snapshot.commonDir) {
       throw new Error(`Repository changed: ${snapshot.repositoryRoot}`);
     }
+    for (const changedPath of changedPaths) validatePath(changedPath);
     await withLock(repository.commonDir, async () => {
       const store = storePath(this.dataDir, repository.commonDir);
       if (
@@ -467,54 +607,107 @@ export class WorkspaceHistory {
       ) {
         throw new Error(`Undo snapshot ref is missing: ${snapshot.refName}`);
       }
-      if (repository.head !== snapshot.head)
-        throw new Error(`Git HEAD changed in ${repository.repositoryRoot}`);
-      const current = await captureFingerprint(
-        this.pi,
-        this.dataDir,
-        repository,
-      );
-      const removals = await treeDifference(
-        this.pi,
-        store,
-        repository.repositoryRoot,
-        snapshot.worktreeTree,
-        current.worktreeTree,
-        "A",
-      );
       const checkoutIndex = path.join(store, `restore-${crypto.randomUUID()}`);
+      const env = privateEnv(store, repository.repositoryRoot, checkoutIndex);
       try {
-        await run(this.pi, repository.repositoryRoot, [
-          "read-tree",
-          snapshot.indexTree,
-        ]);
-        for (const relativePath of removals.sort(
-          (left, right) => right.length - left.length,
-        )) {
-          const absolutePath = path.resolve(
-            repository.repositoryRoot,
-            relativePath,
-          );
-          if (
-            absolutePath !== repository.repositoryRoot &&
-            absolutePath.startsWith(`${repository.repositoryRoot}${path.sep}`)
-          ) {
-            await fs.rm(absolutePath, { force: true });
+        await run(this.pi, repository.repositoryRoot, ["read-tree", snapshot.worktreeTree], env);
+        const worktreeEntries = new Map<string, TreeEntry>();
+        const indexEntries = new Map<string, TreeEntry>();
+        for (const changedPath of changedPaths) {
+          for (const [tree, entries] of [
+            [snapshot.worktreeTree, worktreeEntries],
+            [snapshot.indexTree, indexEntries],
+          ] as const) {
+            const listing = await text(
+              this.pi,
+              repository.repositoryRoot,
+              ["ls-tree", "-z", tree, "--", changedPath],
+              privateEnv(store, repository.repositoryRoot),
+            );
+            for (const item of parseNul(listing)) {
+              const entry = parseTreeEntry(item);
+              if (entry) entries.set(entry.path, entry);
+            }
           }
         }
-        const env = privateEnv(store, repository.repositoryRoot, checkoutIndex);
-        await run(
-          this.pi,
-          repository.repositoryRoot,
-          ["read-tree", snapshot.worktreeTree],
-          env,
+        const selected = new Set(changedPaths);
+        const deepestFirst = [...changedPaths].sort(
+          (left, right) => right.split("/").length - left.split("/").length,
         );
-        await run(
-          this.pi,
-          repository.repositoryRoot,
-          ["checkout-index", "--all", "--force"],
-          env,
-        );
+        for (const changedPath of deepestFirst) {
+          if (worktreeEntries.has(changedPath)) continue;
+          const absolute = path.join(repository.repositoryRoot, changedPath);
+          try {
+            const stat = await fs.lstat(absolute);
+            if (stat.isDirectory()) {
+              const descendants = await fs.readdir(absolute, { recursive: true });
+              if (
+                descendants.some(
+                  (entry) =>
+                    !selected.has(
+                      path.join(changedPath, entry.toString()).split(path.sep).join("/"),
+                    ),
+                )
+              ) {
+                throw new Error(`Unselected path blocks restore: ${changedPath}`);
+              }
+            }
+            await fs.rm(absolute, { recursive: true, force: true });
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+          }
+        }
+        for (const entry of [...worktreeEntries.values()].sort(
+          (left, right) => left.path.split("/").length - right.path.split("/").length,
+        )) {
+          const absolute = path.join(repository.repositoryRoot, entry.path);
+          try {
+            const stat = await fs.lstat(absolute);
+            if (stat.isDirectory()) {
+              const descendants = await fs.readdir(absolute, { recursive: true });
+              if (
+                descendants.some(
+                  (child) =>
+                    !selected.has(
+                      path.join(entry.path, child.toString()).split(path.sep).join("/"),
+                    ),
+                )
+              ) {
+                throw new Error(`Unselected path blocks restore: ${entry.path}`);
+              }
+              await fs.rm(absolute, { recursive: true, force: true });
+            }
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+          }
+          await run(
+            this.pi,
+            repository.repositoryRoot,
+            ["checkout-index", "--force", "--", entry.path],
+            env,
+          );
+        }
+        for (const changedPath of changedPaths) {
+          await run(
+            this.pi,
+            repository.repositoryRoot,
+            ["update-index", "--force-remove", "--", changedPath],
+          );
+        }
+        for (const entry of indexEntries.values()) {
+          await run(
+            this.pi,
+            repository.repositoryRoot,
+            [
+              "update-index",
+              "--add",
+              "--cacheinfo",
+              `${entry.mode},${entry.object},${entry.path}`,
+            ],
+          );
+        }
       } finally {
         await fs.rm(checkoutIndex, { force: true });
         await fs.rm(`${checkoutIndex}.lock`, { force: true });
@@ -522,8 +715,13 @@ export class WorkspaceHistory {
     });
   }
 
-  async restoreAll(snapshots: readonly WorkspaceSnapshot[]): Promise<void> {
-    for (const snapshot of snapshots) await this.restore(snapshot);
+  async restoreAllPaths(
+    workspaces: readonly WorkspaceDelta[],
+    side: "before" | "after",
+  ): Promise<void> {
+    for (const workspace of workspaces) {
+      await this.restorePaths(workspace[side], workspace.changedPaths);
+    }
   }
 
   async available(snapshots: readonly WorkspaceSnapshot[]): Promise<boolean> {
@@ -532,9 +730,7 @@ export class WorkspaceHistory {
       if (
         !(await refExists(this.pi, store, snapshot.refName)) ||
         !(await refExists(this.pi, store, `${snapshot.refName}-index`))
-      ) {
-        return false;
-      }
+      ) return false;
     }
     return true;
   }
@@ -544,13 +740,7 @@ export class WorkspaceHistory {
       validateRef(snapshot.refName);
       const store = storePath(this.dataDir, snapshot.commonDir);
       if (!(await Bun.file(path.join(store, "HEAD")).exists())) continue;
-      await run(this.pi, store, [
-        "--git-dir",
-        store,
-        "update-ref",
-        "-d",
-        snapshot.refName,
-      ]);
+      await run(this.pi, store, ["--git-dir", store, "update-ref", "-d", snapshot.refName]);
       await run(this.pi, store, [
         "--git-dir",
         store,
