@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -197,6 +197,49 @@ async function readJsonConfig(path: string): Promise<SandboxConfigFile> {
       `could not read sandbox configuration ${path}: ${error instanceof Error ? error.message : String(error)}`,
       { cause: error },
     );
+  }
+}
+
+
+export function ensureGlobalConfigTemplate(): void {
+  const { globalPath } = getConfigPaths("");
+  if (!existsSync(globalPath)) {
+    try {
+      const templateData = {
+        "//": "Global Oh My Pi Sandbox Configuration",
+        "//_doc1": "These grants punch holes in the sandbox globally across all your projects.",
+        "//_doc2": "If you are experiencing Git credential issues, uncomment the paths below.",
+        "grants": {
+          "//_read_doc": "Allow reading global credentials and configs inside the sandbox",
+          "readPaths": [
+            // "~/.gitconfig",
+            // "~/.config/git",
+            // "~/.npmrc",
+            // "~/.ssh/config",
+            // "~/.ssh/known_hosts"
+          ],
+          "//_write_doc": "Allow writing to specific global paths (use sparingly)",
+          "writePaths": [],
+          "//_domains_doc": "Allow network access to specific domains",
+          "domains": []
+        }
+      };
+      // JSON doesn't support comments, so we write a custom formatted string
+      const jsonContent = `{
+  "_comment_1": "Global Oh My Pi Sandbox Configuration",
+  "_comment_2": "These grants punch holes in the sandbox globally across all your projects.",
+  "_comment_3": "To allow reading global git credentials inside the sandbox, add '~/.gitconfig' and '~/.config/git' to readPaths.",
+  "grants": {
+    "readPaths": [],
+    "writePaths": [],
+    "domains": []
+  }
+}
+`;
+      writeFileSync(globalPath, jsonContent, "utf8");
+    } catch (error) {
+      // Ignore if we can't write it (e.g. read-only install)
+    }
   }
 }
 
