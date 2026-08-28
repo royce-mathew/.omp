@@ -18,7 +18,7 @@ agent/*.db-shm
 agent/*.db-wal
 agent/last-changelog-version
 agent/config.yml
-agent/sandbox.json
+agent/sandbox.*
 logs/
 run/
 cache/
