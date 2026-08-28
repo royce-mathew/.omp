@@ -7,6 +7,7 @@ import {
   getConfigPaths,
   type SandboxConfig,
 } from "./config.ts";
+import type { SandboxCoordinatorStatus, SandboxDisabledReason } from "./coordinator.ts";
 import type { PermissionScope } from "./policy.ts";
 import type { SessionAllowances } from "./runtime.ts";
 
@@ -31,23 +32,23 @@ export async function promptPermission(
   value: string,
   timeoutSeconds: unknown,
   allowParent = false,
+  configPaths?: { globalPath: string; projectPath: string },
+  projectTrusted = ctx.isProjectTrusted(),
 ): Promise<PermissionPromptResult> {
   if (!ctx.hasUI) return { action: "abort", value };
-
-  const projectTrusted = ctx.isProjectTrusted();
   const parentValue = allowParent ? dirname(value) : value;
   const hasDistinctParent = allowParent && parentValue !== value;
   const sessionOption = "Allow this path for this session";
   const parentOption = "Allow parent directory…";
-  const abortOption = "Abort (keep blocked)";
   const projectOption = "Allow this path for this project";
   const globalOption = "Allow this path for all projects";
+  const abortOption = "Abort (keep blocked)";
   const options = [
     sessionOption,
     ...(hasDistinctParent ? [parentOption] : []),
-    abortOption,
     ...(projectTrusted ? [projectOption] : []),
     globalOption,
+    abortOption,
   ];
   const selected = await ctx.ui.select(title, options, {
     timeout: permissionPromptTimeoutMs(timeoutSeconds),
@@ -105,7 +106,7 @@ export async function promptPermission(
   }
 
   if (scope === "session") return { action: scope, value: selectedValue };
-  const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
+  const { globalPath, projectPath } = configPaths ?? getConfigPaths(ctx.cwd);
   const target = scope === "project" ? projectPath : globalPath;
   const confirmed = await ctx.ui.confirm(
     "Persist sandbox permission?",
@@ -120,16 +121,46 @@ export function formatSandboxStatus(config: SandboxConfig): string {
   return `${domains} · ${config.filesystem?.allowWrite?.length ?? 0} write paths`;
 }
 
+function disabledReason(reason: SandboxDisabledReason): string {
+  if (reason === "startup-configuration") return "startup configuration";
+  if (reason === "startup-flag") return "--no-sandbox startup default";
+  return "interactive command";
+}
+
 export function formatSandboxConfiguration(
-  config: SandboxConfig,
-  paths: { globalPath: string; projectPath: string },
+  status: SandboxCoordinatorStatus,
   allowances: SessionAllowances,
-  projectConfigLoaded: boolean,
 ): string {
-  return [
-    "Sandbox Configuration",
+  const { config, paths, state } = status;
+  const stateLabel = state.kind === "enabled"
+    ? "Enabled"
+    : state.kind === "disabled"
+      ? `Disabled (${disabledReason(state.reason)})`
+      : state.kind === "failed"
+        ? `Failed closed (${state.reason})`
+        : "Initializing";
+  const lines = [
+    `Sandbox: ${stateLabel}`,
+    "",
+    "Root Configuration",
     `  Global:  ${paths.globalPath}`,
-    `  Project: ${paths.projectPath}${projectConfigLoaded ? "" : " (ignored: project not trusted)"}`,
+    `  Project: ${paths.projectPath}${status.projectConfigLoaded ? "" : " (ignored: project not trusted)"}`,
+    `  Startup enabled: ${status.startupConfiguredEnabled ?? "(unavailable)"}`,
+    `  Startup --no-sandbox: ${status.startupNoSandbox}`,
+    `  Interactive override: ${status.interactiveOverride}`,
+    `  Permission prompt timeout: ${config?.permissionPromptTimeoutSeconds ?? "(unavailable)"} seconds`,
+  ];
+
+  if (status.configurationError) {
+    lines.push(
+      "",
+      `Configuration error: ${status.configurationError}`,
+      "Fix sandbox.yaml, then reload plugins or restart OMP.",
+    );
+  }
+  if (!config) return lines.join("\n");
+
+  lines.push(
     "",
     "Network (bash and ! commands)",
     `  Allow: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
@@ -145,6 +176,7 @@ export function formatSandboxConfiguration(
     ...(allowances.writePaths.length ? [`  Session write: ${allowances.writePaths.join(", ")}`] : []),
     "",
     "Read allow rules override read denies. Write denies override write allows.",
-    "The sandbox configuration files themselves are protected from shell writes.",
-  ].join("\n");
+    "The root sandbox configuration files are protected from shell writes.",
+  );
+  return lines.join("\n");
 }

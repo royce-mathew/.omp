@@ -96,7 +96,7 @@ function createGrantAwareBashOperations(
       const decision = decideWritePolicy(
         path,
         effective.writePaths,
-        [...(config.filesystem?.denyWrite ?? []), ...session.protectedWritePaths(ctx)],
+        [...(config.filesystem?.denyWrite ?? []), ...session.protectedWritePaths()],
         cwd,
       );
       if (decision === "deny") return result;
@@ -168,7 +168,7 @@ export function registerSandboxBashTool(
   session: SandboxSession,
   permissions: PermissionCoordinator,
 ): void {
-  const nativeBash = new pi.pi.BashTool({ settings: pi.pi.settings } as ConstructorParameter<typeof pi.pi.BashTool>[0]);
+  const nativeBash = new pi.pi.BashTool({ settings: pi.pi.settings } as ConstructorParameters<typeof pi.pi.BashTool>[0]);
   const Type = pi.typebox.Type;
   const parameters = Type.Object({
     command: Type.String({ description: "command to execute" }),

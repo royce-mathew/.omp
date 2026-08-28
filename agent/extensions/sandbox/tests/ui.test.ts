@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent"
 
-import { promptPermission } from "../ui.ts";
+import { DEFAULT_CONFIG } from "../config.ts";
+import { formatSandboxConfiguration, promptPermission } from "../ui.ts";
 
 function contextSelecting(selected: string | string[], confirmed = true): ExtensionContext {
   const selections = Array.isArray(selected) ? [...selected] : [selected];
@@ -59,4 +60,35 @@ test("unknown permission selections fail closed", async () => {
     0,
     true,
   )).toEqual({ action: "abort", value: "/workspace/src/file.ts" });
+});
+
+test("status reports effective state, root inputs, timeout, permissions, and trust", () => {
+  const output = formatSandboxConfiguration({
+    state: { kind: "disabled", reason: "startup-configuration" },
+    config: DEFAULT_CONFIG,
+    configurationError: undefined,
+    paths: {
+      globalPath: "/agent/sandbox.yaml",
+      projectPath: "/root/.omp/sandbox.yaml",
+    },
+    rootCwd: "/root",
+    projectConfigLoaded: false,
+    startupConfiguredEnabled: false,
+    startupNoSandbox: false,
+    participantCount: 1,
+    interactiveOverride: "automatic",
+  }, {
+    domains: ["session.test"],
+    readPaths: ["/session/read"],
+    writePaths: ["/session/write"],
+  });
+
+  expect(output).toContain("Disabled (startup configuration)");
+  expect(output).toContain("/agent/sandbox.yaml");
+  expect(output).toContain("/root/.omp/sandbox.yaml (ignored: project not trusted)");
+  expect(output).toContain("Startup enabled: false");
+  expect(output).toContain("Permission prompt timeout: 600 seconds");
+  expect(output).toContain("session.test");
+  expect(output).toContain("/session/read");
+  expect(output).toContain("/session/write");
 });

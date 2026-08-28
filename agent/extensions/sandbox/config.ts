@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
-import { parse, stringify, parseDocument, type Document, type YAMLSeq, type YAMLMap } from "yaml";
+import { parse, parseDocument, type Document, type YAMLSeq, type YAMLMap } from "yaml";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -11,19 +11,23 @@ import {
 import { getAgentDir } from "@oh-my-pi/pi-coding-agent";
 
 export type SandboxConfig = SandboxRuntimeConfig & {
-  enabled?: boolean;
-  permissionPromptTimeoutSeconds?: number;
+  enabled: boolean;
+  permissionPromptTimeoutSeconds: number;
 };
 
 type NetworkConfig = NonNullable<SandboxConfig["network"]>;
 type FilesystemConfig = NonNullable<SandboxConfig["filesystem"]>;
 
-
+export class SandboxConfigurationError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(`sandbox.yaml is misconfigured: ${message}`, options);
+    this.name = "SandboxConfigurationError";
+  }
+}
 
 export type SandboxConfigFile = Omit<Partial<SandboxConfig>, "network" | "filesystem"> & {
   network?: Partial<NetworkConfig>;
   filesystem?: Partial<FilesystemConfig>;
-  
 };
 
 export const DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS = 10 * 60;
@@ -59,6 +63,34 @@ function stringArray(value: unknown): string[] | undefined {
     return undefined;
   }
   return value;
+}
+
+function validateSection(
+  name: "network" | "filesystem",
+  value: unknown,
+): void {
+  if (value !== undefined
+    && (!value || typeof value !== "object" || Array.isArray(value))) {
+    throw new Error(`${name} must be a YAML object`);
+  }
+}
+
+function validatePermissionArrays(config: SandboxConfigFile): void {
+  const arrays = [
+    ["network.allowedDomains", config.network?.allowedDomains],
+    ["network.deniedDomains", config.network?.deniedDomains],
+    ["network.allowUnixSockets", config.network?.allowUnixSockets],
+    ["network.allowMachLookup", config.network?.allowMachLookup],
+    ["filesystem.denyRead", config.filesystem?.denyRead],
+    ["filesystem.allowRead", config.filesystem?.allowRead],
+    ["filesystem.allowWrite", config.filesystem?.allowWrite],
+    ["filesystem.denyWrite", config.filesystem?.denyWrite],
+  ] as const;
+  for (const [name, value] of arrays) {
+    if (value !== undefined && stringArray(value) === undefined) {
+      throw new Error(`${name} must be an array of strings`);
+    }
+  }
 }
 
 function mergeConfiguredArray(
@@ -152,8 +184,8 @@ async function readYamlConfig(path: string): Promise<SandboxConfigFile> {
     }
     return parsed as SandboxConfigFile;
   } catch (error) {
-    throw new Error(
-      `could not read sandbox configuration ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    throw new SandboxConfigurationError(
+      `${path}: ${error instanceof Error ? error.message : String(error)}`,
       { cause: error },
     );
   }
@@ -162,30 +194,13 @@ async function readYamlConfig(path: string): Promise<SandboxConfigFile> {
 
 export function ensureGlobalConfigTemplate(): void {
   const { globalPath } = getConfigPaths("");
-  if (!existsSync(globalPath)) {
-    try {
-      const templateData = {
-        "//": "Global Oh My Pi Sandbox Configuration",
-        "//_doc1": "These grants punch holes in the sandbox globally across all your projects.",
-        "//_doc2": "If you are experiencing Git credential issues, uncomment the paths below.",
-        "grants": {
-          "//_read_doc": "Allow reading global credentials and configs inside the sandbox",
-          "readPaths": [
-            // "~/.gitconfig",
-            // "~/.config/git",
-            // "~/.npmrc",
-            // "~/.ssh/config",
-            // "~/.ssh/known_hosts"
-          ],
-          "//_write_doc": "Allow writing to specific global paths (use sparingly)",
-          "writePaths": [],
-          "//_domains_doc": "Allow network access to specific domains",
-          "domains": []
-        }
-      };
-      // JSON doesn't support comments, so we write a custom formatted string
-      const yamlContent = `# Global Oh My Pi Sandbox Configuration
-# This file is the absolute source of truth for sandbox permissions.
+  if (existsSync(globalPath)) return;
+  try {
+    const yamlContent = `# Global Oh My Pi Sandbox Configuration
+# This file is the source of truth for sandbox startup and permissions.
+
+enabled: true
+permissionPromptTimeoutSeconds: 600
 
 network:
   allowedDomains:
@@ -216,12 +231,10 @@ filesystem:
     - /tmp
   denyWrite:
     - .env
-
 `;
-      writeFileSync(globalPath, yamlContent, "utf8");
-    } catch (error) {
-      // Ignore if we can't write it (e.g. read-only install)
-    }
+    writeFileSync(globalPath, yamlContent, "utf8");
+  } catch {
+    // A read-only agent directory should not prevent the extension from loading.
   }
 }
 
@@ -232,55 +245,45 @@ export function getConfigPaths(cwd: string): { globalPath: string; projectPath: 
   };
 }
 
-const LEGACY_LINUX_DENY_WRITE = [".env", ".env.*", "*.pem", "*.key"];
-
-function normalizeConfigFileForPlatform(
-  config: SandboxConfigFile,
-  platform: NodeJS.Platform = process.platform,
-): SandboxConfigFile {
-  const denyWrite = config.filesystem?.denyWrite;
-  if (platform !== "linux"
-    || denyWrite?.length !== LEGACY_LINUX_DENY_WRITE.length
-    || !denyWrite.every((value, index) => value === LEGACY_LINUX_DENY_WRITE[index])) {
-    return config;
-  }
-  return {
-    ...config,
-    filesystem: { ...config.filesystem, denyWrite: [".env"] },
-  };
-}
-
 function validateConfig(config: SandboxConfig): SandboxConfig {
   const { enabled, permissionPromptTimeoutSeconds, ...runtimeConfig } = config;
-  if (enabled !== undefined && typeof enabled !== "boolean") {
-    throw new Error("sandbox enabled must be a boolean");
+  if (typeof enabled !== "boolean") {
+    throw new Error("enabled must be a boolean");
   }
-  if (permissionPromptTimeoutSeconds !== undefined
-    && (typeof permissionPromptTimeoutSeconds !== "number"
-      || !Number.isFinite(permissionPromptTimeoutSeconds)
-      || permissionPromptTimeoutSeconds < 0)) {
-    throw new Error("sandbox permissionPromptTimeoutSeconds must be a non-negative finite number");
+  if (typeof permissionPromptTimeoutSeconds !== "number"
+    || !Number.isFinite(permissionPromptTimeoutSeconds)
+    || permissionPromptTimeoutSeconds < 0) {
+    throw new Error("permissionPromptTimeoutSeconds must be a non-negative finite number");
   }
   const parsed = SandboxRuntimeConfigSchema.safeParse(runtimeConfig);
   if (!parsed.success) {
     const issues = parsed.error.issues.map((issue) =>
       `${issue.path.join(".") || "configuration"}: ${issue.message}`).join("; ");
-    throw new Error(`invalid sandbox configuration: ${issues}`);
+    throw new Error(issues);
   }
   return { ...parsed.data, enabled, permissionPromptTimeoutSeconds };
 }
-
 export async function loadConfig(cwd: string, includeProject = true): Promise<SandboxConfig> {
   const { globalPath, projectPath } = getConfigPaths(cwd);
-  const [globalConfig, projectConfig] = await Promise.all([
-    readYamlConfig(globalPath),
-    includeProject ? readYamlConfig(projectPath) : Promise.resolve({}),
-  ]);
-  return validateConfig(mergeConfigLayers(
-    DEFAULT_CONFIG,
-    normalizeConfigFileForPlatform(globalConfig),
-    normalizeConfigFileForPlatform(projectConfig),
-  ));
+  try {
+    const [globalConfig, projectConfig] = await Promise.all([
+      readYamlConfig(globalPath),
+      includeProject ? readYamlConfig(projectPath) : Promise.resolve({} as SandboxConfigFile),
+    ]);
+    validateSection("network", globalConfig.network);
+    validateSection("filesystem", globalConfig.filesystem);
+    validateSection("network", projectConfig.network);
+    validateSection("filesystem", projectConfig.filesystem);
+    validatePermissionArrays(globalConfig);
+    validatePermissionArrays(projectConfig);
+    return validateConfig(mergeConfigLayers(DEFAULT_CONFIG, globalConfig, projectConfig));
+  } catch (error) {
+    if (error instanceof SandboxConfigurationError) throw error;
+    throw new SandboxConfigurationError(
+      error instanceof Error ? error.message : String(error),
+      { cause: error },
+    );
+  }
 }
 
 const saveQueues = new Map<string, Promise<void>>();
@@ -296,6 +299,11 @@ async function updateConfig(
       source = await readFile(path, "utf8");
     }
     const doc = parseDocument(source || "{}");
+    if (doc.errors.length > 0) {
+      throw new SandboxConfigurationError(
+        `${path}: ${doc.errors.map((error) => error.message).join("; ")}`,
+      );
+    }
     update(doc);
     await mkdir(dirname(path), { recursive: true });
     const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;

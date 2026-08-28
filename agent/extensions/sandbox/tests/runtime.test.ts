@@ -6,7 +6,6 @@ import {
   buildRuntimeConfig,
   extractBlockedWritePath,
   resolveAllowances,
-  SandboxRuntimeGate,
   supportsNodeEnvProxy,
 } from "../runtime.ts";
 
@@ -75,26 +74,6 @@ describe("sandbox runtime adapter", () => {
       .toBe("/tmp/file");
   });
 
-  test("keeps runtime transitions outside active execution windows", async () => {
-    const gate = new SandboxRuntimeGate();
-    const events: string[] = [];
-    let finishExecution: (() => void) | undefined;
-    const execution = gate.run(async () => {
-      events.push("execution:start");
-      await new Promise<void>((resolve) => { finishExecution = resolve; });
-      events.push("execution:end");
-    });
-    await Promise.resolve();
-
-    const transition = gate.transition(async () => { events.push("transition"); });
-    const queuedExecution = gate.run(async () => { events.push("queued"); });
-    await Promise.resolve();
-    expect(events).toEqual(["execution:start"]);
-
-    finishExecution?.();
-    await Promise.all([execution, transition, queuedExecution]);
-    expect(events).toEqual(["execution:start", "execution:end", "transition", "queued"]);
-  });
 
   test("detects Node versions with environment proxy support", () => {
     expect(supportsNodeEnvProxy("22.20.0")).toBe(false);

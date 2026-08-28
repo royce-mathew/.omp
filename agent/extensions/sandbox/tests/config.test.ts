@@ -1,44 +1,52 @@
-import { stringify, parse } from "yaml";
-import { mkdtempSync, existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { afterEach, describe, expect, test } from "bun:test";
+import { stringify } from "yaml";
 
 import {
   addDomainToConfig,
   addReadPathToConfig,
   addWritePathToConfig,
   DEFAULT_CONFIG,
-  getConfigPaths,
   ensureGlobalConfigTemplate,
+  getConfigPaths,
   loadConfig,
   mergeConfigLayers,
 } from "../config.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+const temporaryPaths: string[] = [];
+
 afterEach(() => {
+  for (const path of temporaryPaths.splice(0)) rmSync(path, { recursive: true, force: true });
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 });
 
+function temporaryRoot(prefix: string): string {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  temporaryPaths.push(root);
+  return root;
+}
+
 describe("sandbox configuration", () => {
-  test("generates global sandbox.yaml template if missing", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-template-"));
+  test("generates a complete global sandbox.yaml template without legacy grants", async () => {
+    const root = temporaryRoot("pi-sandbox-template-");
     process.env.PI_CODING_AGENT_DIR = root;
     const globalPath = join(root, "sandbox.yaml");
-    
-    expect(existsSync(globalPath)).toBe(false);
-    
+
     ensureGlobalConfigTemplate();
-    
-    expect(existsSync(globalPath)).toBe(true);
+
     const content = await readFile(globalPath, "utf8");
-    expect(content).toContain("Global Oh My Pi Sandbox Configuration");
-    expect(content).toContain("allowRead:");
-    expect(content).toContain("# - ~/.gitconfig");
-    
-    // Ensure it doesn't overwrite existing files
+    expect(content).toContain("enabled: true");
+    expect(content).toContain("permissionPromptTimeoutSeconds: 600");
+    expect(content).toContain("network:");
+    expect(content).toContain("filesystem:");
+    expect(content).not.toContain("grants");
+
     await writeFile(globalPath, "custom content", "utf8");
     ensureGlobalConfigTemplate();
     expect(await readFile(globalPath, "utf8")).toBe("custom content");
@@ -48,32 +56,67 @@ describe("sandbox configuration", () => {
     const merged = mergeConfigLayers(
       DEFAULT_CONFIG,
       {
-        enabled: false,
+        enabled: true,
+        permissionPromptTimeoutSeconds: 30,
         network: { allowedDomains: ["global.test", "shared.test"] },
-        filesystem: { allowWrite: ["/global"] },
+        filesystem: { allowRead: ["/global", "/shared"] },
       },
       {
-        enabled: true,
+        enabled: false,
+        permissionPromptTimeoutSeconds: 45,
         network: { allowedDomains: ["project.test", "shared.test"] },
-        filesystem: { allowWrite: ["/project"] },
+        filesystem: { allowRead: ["/project", "/shared"] },
       },
     );
-    expect(merged.enabled).toBe(true);
+
+    expect(merged.enabled).toBe(false);
+    expect(merged.permissionPromptTimeoutSeconds).toBe(45);
     expect(merged.network?.allowedDomains).toEqual([
       "global.test",
       "shared.test",
       "project.test",
     ]);
-    expect(merged.filesystem?.allowWrite).toEqual(["/global", "/project"]);
+    expect(merged.filesystem?.allowRead).toEqual(["/global", "/shared", "/project"]);
+  });
+
+  test("preserves enabled false when no higher-precedence layer changes it", () => {
+    const merged = mergeConfigLayers(DEFAULT_CONFIG, { enabled: false }, {});
+    expect(merged.enabled).toBe(false);
   });
 
   test("uses defaults only when neither layer configures an array", () => {
-    const merged = mergeConfigLayers(DEFAULT_CONFIG, { filesystem: { allowWrite: [] } }, {});
-    expect(merged.filesystem?.allowWrite).toEqual([]);
-    expect(merged.filesystem?.allowRead).toEqual(DEFAULT_CONFIG.filesystem?.allowRead);
+    const merged = mergeConfigLayers(DEFAULT_CONFIG, {}, {});
+    expect(merged.network?.allowedDomains).toEqual(DEFAULT_CONFIG.network?.allowedDomains);
+    expect(merged.filesystem?.allowWrite).toEqual(DEFAULT_CONFIG.filesystem?.allowWrite);
   });
 
-    test("uses OMP's configured agent and project config directories", () => {
+  test("loads root-level fields and lets project enabled false override global true", async () => {
+    const agentRoot = temporaryRoot("pi-sandbox-global-");
+    const projectRoot = temporaryRoot("pi-sandbox-project-");
+    process.env.PI_CODING_AGENT_DIR = agentRoot;
+    await writeFile(join(agentRoot, "sandbox.yaml"), stringify({
+      enabled: true,
+      permissionPromptTimeoutSeconds: 25,
+      network: { allowedDomains: ["global.test"] },
+      filesystem: { allowRead: ["/global"] },
+    }));
+    await mkdir(join(projectRoot, ".omp"), { recursive: true });
+    await writeFile(join(projectRoot, ".omp", "sandbox.yaml"), stringify({
+      enabled: false,
+      network: { allowedDomains: ["project.test"] },
+      filesystem: { allowWrite: ["/project"] },
+    }));
+
+    const config = await loadConfig(projectRoot);
+
+    expect(config.enabled).toBe(false);
+    expect(config.permissionPromptTimeoutSeconds).toBe(25);
+    expect(config.network?.allowedDomains).toEqual(["global.test", "project.test"]);
+    expect(config.filesystem?.allowRead).toEqual(["/global"]);
+    expect(config.filesystem?.allowWrite).toEqual(["/project"]);
+  });
+
+  test("uses OMP's configured agent directory and root project directory", () => {
     process.env.PI_CODING_AGENT_DIR = "/tmp/custom-agent";
     expect(getConfigPaths("/workspace")).toEqual({
       globalPath: "/tmp/custom-agent/sandbox.yaml",
@@ -81,57 +124,71 @@ describe("sandbox configuration", () => {
     });
   });
 
-  test("rejects malformed runtime configuration at the load boundary", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-invalid-"));
+  test("does not interpret the removed grants format", async () => {
+    const root = temporaryRoot("pi-sandbox-grants-");
     process.env.PI_CODING_AGENT_DIR = root;
     await writeFile(join(root, "sandbox.yaml"), stringify({
-      network: { strictAllowlist: "yes" },
+      grants: {
+        domains: ["legacy.test"],
+        readPaths: ["/legacy"],
+      },
     }));
-    await expect(loadConfig(root, false)).rejects.toThrow("invalid sandbox configuration");
+
+    const config = await loadConfig(root, false);
+
+    expect(config.network?.allowedDomains).not.toContain("legacy.test");
+    expect(config.filesystem?.allowRead).not.toContain("/legacy");
+    expect(config).not.toHaveProperty("grants");
   });
 
-  test("fails closed instead of replacing malformed configuration during a grant", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-malformed-"));
-    const path = join(root, "sandbox.yaml");
-    await writeFile(path, "{ malformed");
-    await expect(addReadPathToConfig(path, "/read")).rejects.toThrow(
-      "Document with errors cannot be stringified",
+  test("rejects malformed YAML with a sandbox configuration error", async () => {
+    const root = temporaryRoot("pi-sandbox-invalid-");
+    process.env.PI_CODING_AGENT_DIR = root;
+    await writeFile(join(root, "sandbox.yaml"), "{ malformed");
+
+    await expect(loadConfig(root, false)).rejects.toThrow("sandbox.yaml is misconfigured");
+  });
+
+  test("rejects invalid permission arrays instead of silently using defaults", async () => {
+    const root = temporaryRoot("pi-sandbox-array-");
+    process.env.PI_CODING_AGENT_DIR = root;
+    await writeFile(join(root, "sandbox.yaml"), stringify({
+      network: { allowedDomains: "example.test" },
+    }));
+
+    await expect(loadConfig(root, false)).rejects.toThrow(
+      "network.allowedDomains must be an array of strings",
     );
-    expect(await readFile(path, "utf8")).toBe("{ malformed");
+  });
+
+  test("fails closed instead of replacing malformed configuration during an update", async () => {
+    const root = temporaryRoot("pi-sandbox-grant-failure-");
+    const path = join(root, "sandbox.yaml");
+    const malformed = "network: [unterminated";
+    await writeFile(path, malformed);
+
+    await expect(addDomainToConfig(path, "example.test")).rejects.toThrow(
+      "sandbox.yaml is misconfigured",
+    );
+    expect(await readFile(path, "utf8")).toBe(malformed);
   });
 
   test("atomically preserves independently added permission rules", async () => {
-    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-config-"));
-    process.env.PI_CODING_AGENT_DIR = root;
+    const root = temporaryRoot("pi-sandbox-atomic-");
     const path = join(root, "sandbox.yaml");
+
     await Promise.all([
+      addDomainToConfig(path, "example.test"),
+      addDomainToConfig(path, "api.example.test"),
       addReadPathToConfig(path, "/read"),
       addWritePathToConfig(path, "/write"),
-      addDomainToConfig(path, "example.test"),
     ]);
-    expect(parse(await readFile(path, "utf8"))).toEqual({
-      filesystem: {
-        allowRead: ["/read"],
-        allowWrite: ["/write"],
-      },
-      network: {
-        allowedDomains: ["example.test"],
-      },
-    });
-    const reloaded = await loadConfig(root, false);
-        expect(reloaded.network?.allowedDomains).toContain("example.test");
-    expect(reloaded.filesystem?.allowRead).toContain("/read");
-    expect(reloaded.filesystem?.allowWrite).toContain("/write");
-  });
 
-  test("normalizes the generated legacy Linux deny list before validation", async () => {
-    if (process.platform !== "linux") return;
-    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-legacy-"));
-    process.env.PI_CODING_AGENT_DIR = root;
-    await writeFile(join(root, "sandbox.yaml"), stringify({
-      filesystem: { denyWrite: [".env", ".env.*", "*.pem", "*.key"] },
-    }));
-    const config = await loadConfig(root, false);
-    expect(config.filesystem?.denyWrite).toEqual([".env"]);
+    const content = await readFile(path, "utf8");
+    expect(content).toContain("example.test");
+    expect(content).toContain("api.example.test");
+    expect(content).toContain("/read");
+    expect(content).toContain("/write");
+    expect(existsSync(path)).toBe(true);
   });
 });

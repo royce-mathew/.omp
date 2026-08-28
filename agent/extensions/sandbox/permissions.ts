@@ -3,7 +3,6 @@ import {
   addDomainToConfig,
   addReadPathToConfig,
   addWritePathToConfig,
-  getConfigPaths,
   type SandboxConfig,
 } from "./config.ts";
 import type { PermissionScope } from "./policy.ts";
@@ -42,6 +41,8 @@ export class PermissionCoordinator {
       value,
       config.permissionPromptTimeoutSeconds,
       kind !== "domain",
+      this.session.processCoordinator.paths,
+      this.session.processCoordinator.status().projectConfigLoaded,
     );
     if (choice.action === "abort") return false;
     await this.apply(ctx, choice.action, kind, choice.value);
@@ -60,15 +61,17 @@ export class PermissionCoordinator {
         readPaths: [...this.session.allowances.readPaths],
         writePaths: [...this.session.allowances.writePaths],
       };
-      const values = kind === "domain"
-        ? next.domains
-        : kind === "read"
-          ? next.readPaths
-          : next.writePaths;
-      if (!values.includes(value)) values.push(value);
+      if (scope === "session") {
+        const values = kind === "domain"
+          ? next.domains
+          : kind === "read"
+            ? next.readPaths
+            : next.writePaths;
+        if (!values.includes(value)) values.push(value);
+      }
 
       const persist = scope === "session" ? undefined : async (): Promise<void> => {
-        const paths = getConfigPaths(ctx.cwd);
+        const paths = this.session.processCoordinator.paths;
         const target = scope === "project" ? paths.projectPath : paths.globalPath;
         if (kind === "domain") await addDomainToConfig(target, value);
         else if (kind === "read") await addReadPathToConfig(target, value);

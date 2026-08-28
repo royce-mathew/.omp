@@ -128,60 +128,6 @@ export async function resetSandbox(): Promise<void> {
   await SandboxManager.reset();
 }
 
-/** Keep global runtime transitions from racing concurrently executing commands. */
-export class SandboxRuntimeGate {
-  private activeExecutions = 0;
-  private executionGate: Promise<void> = Promise.resolve();
-  private transitionQueue: Promise<void> = Promise.resolve();
-  private idleWaiter: Promise<void> | undefined;
-  private signalIdle: (() => void) | undefined;
-
-  async run<T>(operation: () => Promise<T>): Promise<T> {
-    while (true) {
-      const gate = this.executionGate;
-      await gate;
-      // A transition may have closed the gate while this continuation was
-      // queued behind the previously resolved promise.
-      if (gate !== this.executionGate) continue;
-      this.activeExecutions++;
-      try {
-        return await operation();
-      } finally {
-        this.activeExecutions--;
-        if (this.activeExecutions === 0) {
-          this.signalIdle?.();
-          this.signalIdle = undefined;
-          this.idleWaiter = undefined;
-        }
-      }
-    }
-  }
-
-  async transition<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = this.transitionQueue;
-    const { promise: current, resolve: finishTransition } = Promise.withResolvers<void>();
-    // Close the execution gate synchronously, before the first await. Later
-    // transitions replace it with their own promise, keeping callers blocked
-    // until the complete queued transition sequence has settled.
-    this.transitionQueue = current;
-    this.executionGate = current;
-    await previous.catch(() => undefined);
-
-    try {
-      if (this.activeExecutions > 0) {
-        if (!this.idleWaiter) {
-          const { promise, resolve } = Promise.withResolvers<void>();
-          this.idleWaiter = promise;
-          this.signalIdle = resolve;
-        }
-        await this.idleWaiter;
-      }
-      return await operation();
-    } finally {
-      finishTransition();
-    }
-  }
-}
 
 export function supportsNodeEnvProxy(version: string): boolean {
   const [major = 0, minor = 0] = version.split(".").map(Number);

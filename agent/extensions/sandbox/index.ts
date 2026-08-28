@@ -1,7 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { Key } from "@oh-my-pi/pi-tui";
 
-import { getConfigPaths, ensureGlobalConfigTemplate, type SandboxConfig } from "./config.ts";
+import { ensureGlobalConfigTemplate, type SandboxConfig } from "./config.ts";
+import { getSandboxCoordinator, type SandboxCoordinator } from "./coordinator.ts";
 import {
   canonicalizePath,
   decideReadPolicy,
@@ -56,19 +57,19 @@ export function sandboxToolBlockReason(
     : unavailable;
 }
 
-export default function sandboxExtension(pi: ExtensionAPI): void {
-  ensureGlobalConfigTemplate();
-
+export function registerSandboxExtension(
+  pi: ExtensionAPI,
+  coordinator: SandboxCoordinator = getSandboxCoordinator(process.cwd()),
+): SandboxSession {
   pi.registerFlag("no-sandbox", {
-    description: "Disable filesystem and network sandboxing for this session",
+    description: "Start with filesystem and network sandboxing disabled",
     type: "boolean",
     default: false,
   });
-
-  const session = new SandboxSession();
+  const hostTools = createHostToolVisibility(pi);
+  const session = new SandboxSession({ coordinator, hostTools });
   const permissions = new PermissionCoordinator(pi, session);
   registerSandboxBashTool(pi, session, permissions);
-  const hostTools = createHostToolVisibility(pi);
 
   const checkCommandDomains = async (
     command: string,
@@ -86,27 +87,23 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 
   const activateForContext = async (ctx: ExtensionContext): Promise<void> => {
     permissions.reset();
-    if (pi.getFlag("no-sandbox") as boolean) {
-      await hostTools.restore();
-      ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
+    await session.begin(ctx, pi.getFlag("no-sandbox") as boolean);
+    const status = coordinator.status();
+    if (status.state.kind === "enabled") return;
+    if (status.state.kind === "disabled") {
+      const reason = status.state.reason === "startup-flag"
+        ? "--no-sandbox startup default"
+        : "startup configuration";
+      ctx.ui.notify(`Sandbox disabled by ${reason}`, "info");
       return;
     }
-    let config: SandboxConfig;
-    try {
-      config = await session.reloadConfig(ctx);
-    } catch (error) {
-      session.fail(ctx, error);
-      await hostTools.hide();
-      ctx.ui.notify(`${session.blockedMessage()}. Fix the configuration or explicitly disable sandboxing.`, "error");
-      return;
-    }
-    if (config.enabled === false) {
-      await hostTools.restore();
-      ctx.ui.notify("Sandbox disabled by configuration", "info");
-      return;
-    }
-    await session.enable(ctx, true);
-    await hostTools.hide();
+    const reason = status.state.kind === "failed"
+      ? status.state.reason
+      : "sandbox initialization is still in progress";
+    const recovery = status.configurationError
+      ? " Fix sandbox.yaml, then reload plugins or restart OMP."
+      : "";
+    ctx.ui.notify(`Sandbox unavailable; commands blocked: ${reason}.${recovery}`, "error");
   };
 
   pi.on("user_bash", async (event, ctx) => {
@@ -178,7 +175,6 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       };
     }
     const config = await session.config(ctx);
-    if (config.enabled === false) return;
     const effectivePermissions = await session.effective(ctx);
 
     if (session.ready && event.toolName === "bash") {
@@ -211,7 +207,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
           reason: `Sandbox could not determine the ${event.toolName} destination.`,
         };
       }
-      const denyWrite = [...(config.filesystem?.denyWrite ?? []), ...session.protectedWritePaths(ctx)];
+      const denyWrite = [...(config.filesystem?.denyWrite ?? []), ...session.protectedWritePaths()];
       for (const path of paths) {
         const decision = decideWritePolicy(path, effectivePermissions.writePaths, denyWrite, ctx.cwd);
         if (decision === "deny") {
@@ -228,91 +224,93 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    session.begin();
     await activateForContext(ctx);
   });
-
   pi.on("session_switch", async (_event, ctx) => {
-    await session.reset(ctx);
-    await activateForContext(ctx);
+    permissions.reset();
+    await session.switchContext(ctx);
   });
-
   pi.on("session_shutdown", async () => {
     await session.shutdown();
-    await hostTools.restore();
   });
 
+  const notifyCommandFailure = (ctx: ExtensionContext, error: unknown): void => {
+    ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+  };
+  const enable = async (ctx: ExtensionContext): Promise<void> => {
+    try {
+      if (await session.enable(ctx)) ctx.ui.notify("Sandbox enabled for all agents", "info");
+    } catch (error) {
+      notifyCommandFailure(ctx, error);
+    }
+  };
+  const disable = async (ctx: ExtensionContext): Promise<void> => {
+    try {
+      if (await session.disable(ctx)) ctx.ui.notify("Sandbox disabled for all agents", "info");
+    } catch (error) {
+      notifyCommandFailure(ctx, error);
+    }
+  };
   pi.registerShortcut(Key.alt("s"), {
-    description: "Toggle sandboxing for this session",
+    description: "Toggle sandboxing for all agents",
     handler: async (ctx) => {
-      if (session.active) {
-        if (await session.disable(ctx)) {
-          await hostTools.restore();
-          ctx.ui.notify("Sandbox disabled", "info");
-        }
-      } else {
-        const enabled = await session.enable(ctx);
-        await hostTools.hide();
-        if (enabled) ctx.ui.notify("Sandbox enabled", "info");
-      }
+      if (session.active) await disable(ctx);
+      else await enable(ctx);
     },
   });
-
   pi.registerCommand("sandbox-enable", {
-    description: "Enable sandboxing for this session",
-    handler: async (_args, ctx) => {
-      const enabled = await session.enable(ctx);
-      await hostTools.hide();
-      if (enabled) ctx.ui.notify("Sandbox enabled", "info");
-    },
+    description: "Enable sandboxing for all agents",
+    handler: async (_args, ctx) => enable(ctx),
   });
-
   pi.registerCommand("sandbox-disable", {
-    description: "Disable sandboxing for this session",
-    handler: async (_args, ctx) => {
-      if (await session.disable(ctx)) {
-        await hostTools.restore();
-        ctx.ui.notify("Sandbox disabled", "info");
-      }
-    },
+    description: "Disable sandboxing for all agents",
+    handler: async (_args, ctx) => disable(ctx),
   });
 
   pi.registerCommand("sandbox-allow", {
-    description: "Allow a domain or read/write path",
+    description: "Persist and apply a domain or read/write path",
     handler: async (args, ctx) => {
-      const [kind, ...parts] = args.trim().split(/\s+/);
-      const rawValue = parts.join(" ");
-      if ((kind !== "domain" && kind !== "read" && kind !== "write") || !rawValue) {
-        ctx.ui.notify("Usage: /sandbox-allow <domain|read|write> <value>", "error");
-        return;
+      try {
+        coordinator.assertTransitionAvailable();
+        const [kind, ...parts] = args.trim().split(/\s+/);
+        const rawValue = parts.join(" ");
+        if ((kind !== "domain" && kind !== "read" && kind !== "write") || !rawValue) {
+          ctx.ui.notify("Usage: /sandbox-allow <domain|read|write> <value>", "error");
+          return;
+        }
+        const value = kind === "domain" ? rawValue.toLowerCase() : canonicalizePath(rawValue, ctx.cwd);
+        const config = await session.config();
+        const timeout = permissionPromptTimeoutMs(config.permissionPromptTimeoutSeconds);
+        const status = coordinator.status();
+        const scope = status.projectConfigLoaded ? "project" : "global";
+        const target = scope === "project" ? status.paths.projectPath : status.paths.globalPath;
+        const confirmed = await ctx.ui.confirm(
+          "Persist sandbox permission?",
+          `Add ${kind} access to "${value}" in ${target}?`,
+          { timeout },
+        );
+        if (!confirmed) return;
+        await permissions.apply(ctx, scope, kind, value);
+        ctx.ui.notify(`Allowed ${kind}: ${value}`, "info");
+      } catch (error) {
+        notifyCommandFailure(ctx, error);
       }
-      const value = kind === "domain" ? rawValue.toLowerCase() : canonicalizePath(rawValue, ctx.cwd);
-      const config = await session.config(ctx);
-      const timeout = permissionPromptTimeoutMs(config.permissionPromptTimeoutSeconds);
-      const confirmed = await ctx.ui.confirm(
-        "Sandbox permission",
-        `Allow ${kind} access to "${value}" for this session?`,
-        { timeout },
-      );
-      if (!confirmed) return;
-      await permissions.apply(ctx, "session", kind, value);
-      ctx.ui.notify(`Allowed ${kind}: ${value}`, "info");
     },
   });
 
   pi.registerCommand("sandbox", {
-    description: "Show sandbox configuration and session permissions",
+    description: "Show sandbox runtime and root configuration",
     handler: async (_args, ctx) => {
-      const config = await session.config(ctx);
       ctx.ui.notify(
-        `${session.active && session.ready ? "Enabled" : session.active ? `Failed closed (${session.failure ?? "initialization failed"})` : "Disabled"}\n\n${formatSandboxConfiguration(
-          config,
-          getConfigPaths(ctx.cwd),
-          session.allowances,
-          ctx.isProjectTrusted(),
-        )}`,
+        formatSandboxConfiguration(coordinator.status(), session.allowances),
         "info",
       );
     },
   });
+  return session;
+}
+
+export default function sandboxExtension(pi: ExtensionAPI): void {
+  ensureGlobalConfigTemplate();
+  registerSandboxExtension(pi);
 }

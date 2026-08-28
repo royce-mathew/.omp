@@ -1,30 +1,67 @@
 import { dirname } from "node:path";
-import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent"
-import { getConfigPaths, loadConfig, type SandboxConfig } from "./config.ts";
+
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+
 import {
-  initializeSandbox,
-  resetSandbox,
+  SandboxCoordinator,
+  type SandboxDisabledReason,
+  type SandboxParticipant,
+  type SandboxParticipantState,
+} from "./coordinator.ts";
+import type { SandboxConfig } from "./config.ts";
+import {
   resolveAllowances,
-  SandboxRuntimeGate,
   supportsNodeEnvProxy,
   type EffectiveAllowances,
   type SessionAllowances,
 } from "./runtime.ts";
 import { formatSandboxStatus } from "./ui.ts";
 
-type SandboxState =
-  | { kind: "disabled" }
-  | { kind: "initializing" }
-  | { kind: "enabled" }
-  | { kind: "failed"; reason: string };
+export interface HostToolVisibility {
+  hide(): Promise<void>;
+  restore(): Promise<void>;
+}
 
-const emptyAllowances = (): SessionAllowances => ({ domains: [], readPaths: [], writePaths: [] });
+interface SandboxSessionOptions {
+  coordinator?: SandboxCoordinator;
+  hostTools?: HostToolVisibility;
+  label?: string;
+}
 
-export class SandboxSession {
-  private state: SandboxState = { kind: "disabled" };
-  private configSnapshot: { cwd: string; promise: Promise<SandboxConfig> } | undefined;
-  private readonly gate = new SandboxRuntimeGate();
+const NOOP_HOST_TOOLS: HostToolVisibility = {
+  async hide() {},
+  async restore() {},
+};
+
+const emptyAllowances = (): SessionAllowances => ({
+  domains: [],
+  readPaths: [],
+  writePaths: [],
+});
+
+let nextParticipantId = 1;
+
+export class SandboxSession implements SandboxParticipant {
+  readonly id = `sandbox-participant-${nextParticipantId++}`;
+
+  private state: SandboxParticipantState = {
+    kind: "disabled",
+    reason: "startup-configuration",
+  };
+  private readonly coordinator: SandboxCoordinator;
+  private readonly hostTools: HostToolVisibility;
+  private readonly configuredLabel: string | undefined;
+  private context: ExtensionContext | undefined;
+  private registered = true;
   allowances: SessionAllowances = emptyAllowances();
+
+  constructor(options: SandboxSessionOptions = {}) {
+    this.coordinator = options.coordinator ?? new SandboxCoordinator(process.cwd());
+    this.hostTools = options.hostTools ?? NOOP_HOST_TOOLS;
+    this.configuredLabel = options.label;
+    this.coordinator.register(this);
+  }
 
   get active(): boolean {
     return this.state.kind !== "disabled";
@@ -38,138 +75,119 @@ export class SandboxSession {
     return this.state.kind === "failed" ? this.state.reason : undefined;
   }
 
-  private clear(): void {
-    this.state = { kind: "disabled" };
-    this.allowances = emptyAllowances();
-    this.configSnapshot = undefined;
+  get disabledReason(): SandboxDisabledReason | undefined {
+    return this.state.kind === "disabled" ? this.state.reason : undefined;
   }
 
-  begin(): void {
-    this.clear();
+  get processCoordinator(): SandboxCoordinator {
+    return this.coordinator;
   }
 
-  config(ctx: ExtensionContext): Promise<SandboxConfig> {
-    if (this.configSnapshot?.cwd === ctx.cwd) return this.configSnapshot.promise;
-    const promise = loadConfig(ctx.cwd, ctx.isProjectTrusted());
-    this.configSnapshot = { cwd: ctx.cwd, promise };
-    promise.catch(() => {
-      if (this.configSnapshot?.promise === promise) this.configSnapshot = undefined;
-    });
-    return promise;
+  async begin(ctx: ExtensionContext, noSandbox = false): Promise<void> {
+    this.context = ctx;
+    await this.coordinator.initializeParticipant(this, ctx.isProjectTrusted(), noSandbox);
   }
 
-  reloadConfig(ctx: ExtensionContext): Promise<SandboxConfig> {
-    this.configSnapshot = undefined;
-    return this.config(ctx);
+  async switchContext(ctx: ExtensionContext): Promise<void> {
+    if (this.allowances.domains.length
+      || this.allowances.readPaths.length
+      || this.allowances.writePaths.length) {
+      await this.coordinator.refreshPermissions(this, emptyAllowances());
+    }
+    this.context = ctx;
   }
 
-  async effective(ctx: ExtensionContext): Promise<EffectiveAllowances> {
-    return resolveAllowances(await this.config(ctx), this.allowances);
+  config(_ctx?: ExtensionContext): Promise<SandboxConfig> {
+    return Promise.resolve(this.coordinator.configuration());
   }
 
-  protectedWritePaths(ctx: ExtensionContext): string[] {
-    const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
-    return [globalPath, dirname(projectPath)];
+  effective(_ctx?: ExtensionContext): Promise<EffectiveAllowances> {
+    return Promise.resolve(resolveAllowances(this.coordinator.configuration(), this.allowances));
+  }
+
+  protectedWritePaths(): string[] {
+    return [
+      this.coordinator.paths.globalPath,
+      dirname(this.coordinator.paths.projectPath),
+    ];
   }
 
   blockedMessage(): string {
-    return `Sandbox unavailable; command blocked${this.failure ? `: ${this.failure}` : ""}`;
+    return this.coordinator.unavailableMessage();
   }
 
-  fail(ctx: ExtensionContext, error: unknown): void {
-    const reason = error instanceof Error ? error.message : String(error);
-    this.state = { kind: "failed", reason };
-    this.configSnapshot = undefined;
-    ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("error", "sandbox unavailable · commands blocked"));
-  }
-
-  async refresh(
-    ctx: ExtensionContext,
+  refresh(
+    _ctx: ExtensionContext,
     next: SessionAllowances = this.allowances,
     persist?: () => Promise<void>,
   ): Promise<void> {
-    if (!this.ready) {
-      await persist?.();
-      this.allowances = next;
-      return;
-    }
-    const previous = this.allowances;
-    await this.gate.transition(async () => {
-      const config = await this.config(ctx);
-      try {
-        await resetSandbox();
-        await initializeSandbox(config, ctx.cwd, next, this.protectedWritePaths(ctx));
-        await persist?.();
-        this.allowances = next;
-      } catch (error) {
-        try {
-          await resetSandbox().catch(() => undefined);
-          await initializeSandbox(config, ctx.cwd, previous, this.protectedWritePaths(ctx));
-        } catch (rollbackError) {
-          this.fail(ctx, rollbackError);
-        }
-        throw error;
-      }
-    });
+    return this.coordinator.refreshPermissions(this, next, persist);
   }
 
   async enable(ctx: ExtensionContext, quiet = false): Promise<boolean> {
-    if (this.ready) {
-      if (!quiet) ctx.ui.notify("Sandbox is already enabled", "info");
-      return false;
-    }
-    if (process.platform !== "darwin" && process.platform !== "linux") {
-      this.fail(ctx, `Sandbox is not supported on ${process.platform}`);
-      ctx.ui.notify(`${this.blockedMessage()}. Explicitly disable sandboxing to run shell commands.`, "error");
-      return false;
-    }
-
-    this.state = { kind: "initializing" };
-    try {
-      const config = await this.config(ctx);
-      await this.gate.transition(async () => {
-        await resetSandbox().catch(() => undefined);
-        await initializeSandbox(config, ctx.cwd, this.allowances, this.protectedWritePaths(ctx));
-      });
-      this.state = { kind: "enabled" };
-      if (supportsNodeEnvProxy(process.versions.node)) process.env.NODE_USE_ENV_PROXY ??= "1";
-      ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", formatSandboxStatus(config)));
-      return true;
-    } catch (error) {
-      await this.gate.transition(() => resetSandbox().catch(() => undefined));
-      this.fail(ctx, error);
-      ctx.ui.notify(`${this.blockedMessage()}. Explicitly disable sandboxing to run shell commands.`, "error");
-      return false;
-    }
-  }
-
-  async reset(ctx: ExtensionContext): Promise<void> {
-    await this.gate.transition(() => resetSandbox().catch(() => undefined));
-    this.clear();
-    ctx.ui.setStatus("sandbox", undefined);
+    this.context = ctx;
+    const changed = await this.coordinator.enable();
+    if (!changed && !quiet) ctx.ui.notify("Sandbox is already enabled", "info");
+    if (changed && !this.ready && !quiet) ctx.ui.notify(this.blockedMessage(), "error");
+    return changed && this.ready;
   }
 
   async disable(ctx: ExtensionContext, quiet = false): Promise<boolean> {
-    if (!this.active) {
-      if (!quiet) ctx.ui.notify("Sandbox is already disabled", "info");
-      return false;
-    }
-    await this.gate.transition(() => resetSandbox().catch(() => undefined));
-    this.state = { kind: "disabled" };
-    this.configSnapshot = undefined;
-    ctx.ui.setStatus("sandbox", undefined);
-    return true;
+    this.context = ctx;
+    const changed = await this.coordinator.disable();
+    if (!changed && !quiet) ctx.ui.notify("Sandbox is already disabled", "info");
+    return changed;
   }
 
   run<T>(operation: () => Promise<T>): Promise<T> {
-    return this.gate.run(() => {
-      if (!this.ready) throw new Error(this.blockedMessage());
-      return operation();
-    });
+    return this.coordinator.run(this, operation);
   }
 
   async shutdown(): Promise<void> {
-    await this.gate.transition(() => resetSandbox().catch(() => undefined));
-    this.clear();
+    if (!this.registered) return;
+    await this.coordinator.unregister(this);
+    this.state = { kind: "disabled", reason: "interactive" };
+    this.allowances = emptyAllowances();
+    await this.hostTools.restore();
+    this.registered = false;
+  }
+
+  label(): string {
+    if (this.configuredLabel) return this.configuredLabel;
+    const sessionId = this.context?.sessionManager?.getSessionId();
+    if (!sessionId) return this.id;
+    const ref = AgentRegistry.global().list().find((candidate) =>
+      candidate.session?.sessionManager.getSessionId() === sessionId);
+    return ref?.displayName ?? ref?.id ?? sessionId;
+  }
+
+  setAllowances(next: SessionAllowances): void {
+    this.allowances = next;
+  }
+
+  async applyState(
+    state: SandboxParticipantState,
+    config: SandboxConfig | undefined,
+  ): Promise<void> {
+    this.state = state;
+    if (state.kind === "disabled") await this.hostTools.restore();
+    else await this.hostTools.hide();
+
+    const ctx = this.context;
+    if (!ctx) return;
+    if (state.kind === "disabled") {
+      ctx.ui.setStatus("sandbox", undefined);
+      return;
+    }
+    if (state.kind === "enabled" && config) {
+      if (supportsNodeEnvProxy(process.versions.node)) process.env.NODE_USE_ENV_PROXY ??= "1";
+      ctx.ui.setStatus("sandbox", formatSandboxStatus(config));
+      return;
+    }
+    if (state.kind === "initializing") {
+      ctx.ui.setStatus("sandbox", "sandbox initializing");
+      return;
+    }
+    ctx.ui.setStatus("sandbox", "sandbox unavailable · commands blocked");
   }
 }
