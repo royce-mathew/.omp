@@ -227,20 +227,41 @@ export function ensureGlobalConfigTemplate(): void {
       };
       // JSON doesn't support comments, so we write a custom formatted string
       const yamlContent = `# Global Oh My Pi Sandbox Configuration
-# These grants punch holes in the sandbox globally across all your projects.
+# This file is the absolute source of truth for sandbox permissions.
 
-# Note: Oh My Pi automatically allows read/write to the current directory ('.')
-# and grants network access to github.com, npmjs.org, and pypi.org by default.
-# You do not need to specify them here unless you are replacing the base lists.
+network:
+  allowedDomains:
+    - npmjs.org
+    - "*.npmjs.org"
+    - registry.npmjs.org
+    - registry.yarnpkg.com
+    - pypi.org
+    - "*.pypi.org"
+    - github.com
+    - "*.github.com"
+    - api.github.com
+    - raw.githubusercontent.com
+  deniedDomains: []
 
-grants:
-  readPaths:
+filesystem:
+  denyRead:
+    - /Users
+    - /home
+  allowRead:
+    - .
+    - ~/.config
+    - ~/.local
     # Uncomment to allow agents to read your global git config:
     # - ~/.gitconfig
-    # - ~/.config/git
+  allowWrite:
+    - .
+    - /tmp
+  denyWrite:
+    - .env
 
+grants:
+  readPaths: []
   writePaths: []
-
   domains: []
 `;
       writeFileSync(globalPath, yamlContent, "utf8");
