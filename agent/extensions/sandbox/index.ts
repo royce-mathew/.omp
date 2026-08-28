@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { Key } from "@oh-my-pi/pi-tui";
 
-import { getConfigPaths, type SandboxConfig } from "./config.ts";
+import { getConfigPaths, ensureGlobalConfigTemplate, type SandboxConfig } from "./config.ts";
 import {
   canonicalizePath,
   decideReadPolicy,
@@ -57,6 +57,8 @@ export function sandboxToolBlockReason(
 }
 
 export default function sandboxExtension(pi: ExtensionAPI): void {
+  ensureGlobalConfigTemplate();
+
   pi.registerFlag("no-sandbox", {
     description: "Disable filesystem and network sandboxing for this session",
     type: "boolean",
