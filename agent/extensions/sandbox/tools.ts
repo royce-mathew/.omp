@@ -1,9 +1,7 @@
 import { randomUUID } from "node:crypto";
 
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-} from "@oh-my-pi/pi-coding-agent";
+import { BashTool, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
 
 import { decideWritePolicy, canonicalizePath } from "./policy.ts";
 import { PermissionCoordinator } from "./permissions.ts";
@@ -170,6 +168,7 @@ export function registerSandboxBashTool(
   session: SandboxSession,
   permissions: PermissionCoordinator,
 ): void {
+  const nativeBash = new pi.pi.BashTool({ settings: pi.pi.settings } as ConstructorParameter<typeof pi.pi.BashTool>[0]);
   const Type = pi.typebox.Type;
   const parameters = Type.Object({
     command: Type.String({ description: "command to execute" }),
@@ -193,7 +192,7 @@ export function registerSandboxBashTool(
     label: "Bash",
     description: "Execute a foreground shell command. When sandboxing is enabled, filesystem and network access follow sandbox.yaml.",
     parameters,
-    approval: "exec",
+    approval: nativeBash.approval,
     loadMode: "essential",
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       if (!session.active) {
