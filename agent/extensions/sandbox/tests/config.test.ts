@@ -35,7 +35,7 @@ describe("sandbox configuration", () => {
     expect(existsSync(globalPath)).toBe(true);
     const content = await readFile(globalPath, "utf8");
     expect(content).toContain("Global Oh My Pi Sandbox Configuration");
-    expect(content).toContain("readPaths:");
+    expect(content).toContain("allowRead:");
     expect(content).toContain("# - ~/.gitconfig");
     
     // Ensure it doesn't overwrite existing files
