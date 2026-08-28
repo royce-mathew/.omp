@@ -1,5 +1,5 @@
 import { stringify, parse } from "yaml";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +11,7 @@ import {
   addWritePathToConfig,
   DEFAULT_CONFIG,
   getConfigPaths,
+  ensureGlobalConfigTemplate,
   loadConfig,
   mergeConfigLayers,
 } from "../config.ts";
@@ -22,6 +23,27 @@ afterEach(() => {
 });
 
 describe("sandbox configuration", () => {
+  test("generates global sandbox.yaml template if missing", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-template-"));
+    process.env.PI_CODING_AGENT_DIR = root;
+    const globalPath = join(root, "sandbox.yaml");
+    
+    expect(existsSync(globalPath)).toBe(false);
+    
+    ensureGlobalConfigTemplate();
+    
+    expect(existsSync(globalPath)).toBe(true);
+    const content = await readFile(globalPath, "utf8");
+    expect(content).toContain("Global Oh My Pi Sandbox Configuration");
+    expect(content).toContain("readPaths:");
+    expect(content).toContain("# - ~/.gitconfig");
+    
+    // Ensure it doesn't overwrite existing files
+    await writeFile(globalPath, "custom content", "utf8");
+    ensureGlobalConfigTemplate();
+    expect(await readFile(globalPath, "utf8")).toBe("custom content");
+  });
+
   test("merges arrays additively and scalars by project precedence", () => {
     const merged = mergeConfigLayers(
       DEFAULT_CONFIG,
