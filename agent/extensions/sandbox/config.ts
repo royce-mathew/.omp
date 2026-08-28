@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
-import { parse, stringify } from "yaml";
+import { parse, stringify, parseDocument, type Document, type YAMLSeq, type YAMLMap } from "yaml";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -18,16 +18,12 @@ export type SandboxConfig = SandboxRuntimeConfig & {
 type NetworkConfig = NonNullable<SandboxConfig["network"]>;
 type FilesystemConfig = NonNullable<SandboxConfig["filesystem"]>;
 
-export interface SandboxGrantConfig {
-  domains?: string[];
-  readPaths?: string[];
-  writePaths?: string[];
-}
+
 
 export type SandboxConfigFile = Omit<Partial<SandboxConfig>, "network" | "filesystem"> & {
   network?: Partial<NetworkConfig>;
   filesystem?: Partial<FilesystemConfig>;
-  grants?: SandboxGrantConfig;
+  
 };
 
 export const DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS = 10 * 60;
@@ -76,33 +72,10 @@ function mergeConfiguredArray(
   return [...new Set([...(globalEntries ?? []), ...(projectEntries ?? [])])];
 }
 
-function configuredGrantEntries(value: unknown, field: string): string[] {
-  if (value === undefined) return [];
-  const entries = stringArray(value);
-  if (entries === undefined) {
-    throw new Error(`sandbox grants.${field} must be an array of strings`);
-  }
-  return entries;
-}
-
-function mergeGrantArray(
-  base: string[],
-  globalValue: unknown,
-  projectValue: unknown,
-  field: string,
-): string[] {
-  return [...new Set([
-    ...base,
-    ...configuredGrantEntries(globalValue, field),
-    ...configuredGrantEntries(projectValue, field),
-  ])];
-}
-
 function mergeObjects(base: SandboxConfig, overrides: SandboxConfigFile): SandboxConfig {
-  const { grants: _grants, ...runtimeOverrides } = overrides;
   return {
     ...base,
-    ...runtimeOverrides,
+    ...overrides,
     network: overrides.network
       ? ({ ...base.network, ...overrides.network } as NetworkConfig)
       : base.network,
@@ -123,16 +96,11 @@ export function mergeConfigLayers(
     ...merged,
     network: {
       ...merged.network,
-      allowedDomains: mergeGrantArray(
-        mergeConfiguredArray(
-          defaults.network?.allowedDomains,
-          globalConfig.network?.allowedDomains,
-          projectConfig.network?.allowedDomains,
-        ) ?? [],
-        globalConfig.grants?.domains,
-        projectConfig.grants?.domains,
-        "domains",
-      ),
+      allowedDomains: mergeConfiguredArray(
+        defaults.network?.allowedDomains,
+        globalConfig.network?.allowedDomains,
+        projectConfig.network?.allowedDomains,
+      ) ?? [],
       deniedDomains: mergeConfiguredArray(
         defaults.network?.deniedDomains,
         globalConfig.network?.deniedDomains,
@@ -156,26 +124,16 @@ export function mergeConfigLayers(
         globalConfig.filesystem?.denyRead,
         projectConfig.filesystem?.denyRead,
       ) ?? [],
-      allowRead: mergeGrantArray(
-        mergeConfiguredArray(
-          defaults.filesystem?.allowRead,
-          globalConfig.filesystem?.allowRead,
-          projectConfig.filesystem?.allowRead,
-        ) ?? [],
-        globalConfig.grants?.readPaths,
-        projectConfig.grants?.readPaths,
-        "readPaths",
-      ),
-      allowWrite: mergeGrantArray(
-        mergeConfiguredArray(
-          defaults.filesystem?.allowWrite,
-          globalConfig.filesystem?.allowWrite,
-          projectConfig.filesystem?.allowWrite,
-        ) ?? [],
-        globalConfig.grants?.writePaths,
-        projectConfig.grants?.writePaths,
-        "writePaths",
-      ),
+      allowRead: mergeConfiguredArray(
+        defaults.filesystem?.allowRead,
+        globalConfig.filesystem?.allowRead,
+        projectConfig.filesystem?.allowRead,
+      ) ?? [],
+      allowWrite: mergeConfiguredArray(
+        defaults.filesystem?.allowWrite,
+        globalConfig.filesystem?.allowWrite,
+        projectConfig.filesystem?.allowWrite,
+      ) ?? [],
       denyWrite: mergeConfiguredArray(
         defaults.filesystem?.denyWrite,
         globalConfig.filesystem?.denyWrite,
@@ -259,10 +217,6 @@ filesystem:
   denyWrite:
     - .env
 
-grants:
-  readPaths: []
-  writePaths: []
-  domains: []
 `;
       writeFileSync(globalPath, yamlContent, "utf8");
     } catch (error) {
@@ -333,16 +287,20 @@ const saveQueues = new Map<string, Promise<void>>();
 
 async function updateConfig(
   path: string,
-  update: (config: SandboxConfigFile) => void,
+  update: (doc: Document) => void,
 ): Promise<void> {
   const previous = saveQueues.get(path) ?? Promise.resolve();
   const task = previous.catch(() => undefined).then(async () => {
-    const config = await readYamlConfig(path);
-    update(config);
+    let source = "";
+    if (existsSync(path)) {
+      source = await readFile(path, "utf8");
+    }
+    const doc = parseDocument(source || "{}");
+    update(doc);
     await mkdir(dirname(path), { recursive: true });
     const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      await writeFile(temporaryPath, `${stringify(config)}\n`, "utf8");
+      await writeFile(temporaryPath, doc.toString(), "utf8");
       await rename(temporaryPath, path);
     } finally {
       await rm(temporaryPath, { force: true });
@@ -361,17 +319,22 @@ async function addUniqueRule(
   kind: "domain" | "read" | "write",
   value: string,
 ): Promise<void> {
-  await updateConfig(path, (config) => {
-    const key = kind === "domain" ? "domains" : kind === "read" ? "readPaths" : "writePaths";
-    const raw = config.grants?.[key];
-    const existing = stringArray(raw);
-    if (raw !== undefined && existing === undefined) {
-      throw new Error(`sandbox grants.${key} must be an array of strings`);
+  await updateConfig(path, (doc) => {
+    const parentKey = kind === "domain" ? "network" : "filesystem";
+    const key = kind === "domain" ? "allowedDomains" : kind === "read" ? "allowRead" : "allowWrite";
+    
+    if (!doc.has(parentKey)) {
+      doc.set(parentKey, doc.createNode({}));
     }
-    config.grants = {
-      ...config.grants,
-      [key]: [...new Set([...(existing ?? []), value])],
-    };
+    const parent = doc.get(parentKey) as YAMLMap;
+    if (!parent.has(key)) {
+      parent.set(key, doc.createNode([]));
+    }
+    const seq = parent.get(key) as YAMLSeq;
+    const items = seq.items.map((node: any) => node.value);
+    if (!items.includes(value)) {
+      seq.add(value);
+    }
   });
 }
 
