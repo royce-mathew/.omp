@@ -373,4 +373,99 @@ describe("WorkspaceHistory selective snapshots", () => {
     expect(await Bun.file(path.join(root, "tracked.txt")).text()).toBe("after\n");
     expect(await indexText(root, "tracked.txt")).toBe("baseline\n");
   });
+
+  it("resolves and captures a workspace in a detached HEAD state", async () => {
+    const root = await repository({ "detached.txt": "baseline\n" });
+    await $`git checkout HEAD^0`.cwd(root).quiet();
+    const headState = await head(root);
+
+    const workspace = history(root);
+    const before = await workspace.capture([root], "session", "detached", "before");
+    await Bun.write(path.join(root, "detached.txt"), "changed\n");
+    const after = await workspace.capture([root], "session", "detached", "after");
+    
+    const [delta] = await workspace.deltas(before, after);
+    await workspace.restoreAllPaths([delta!], "before");
+    expect(await Bun.file(path.join(root, "detached.txt")).text()).toBe("baseline\n");
+    await workspace.restoreAllPaths([delta!], "after");
+    expect(await Bun.file(path.join(root, "detached.txt")).text()).toBe("changed\n");
+    expect(await head(root)).toBe(headState);
+  });
+
+  it("resolves and captures an unborn repository (zero commits)", async () => {
+    const root = await fs.mkdtemp("/tmp/omp-undo-redo-git-unborn-");
+    cleanup.push(root);
+    await $`git init --initial-branch=main && git config user.email tester@example.com && git config user.name Tester`.cwd(root).quiet();
+    
+    const workspace = history(root);
+    await Bun.write(path.join(root, "file.txt"), "v1\n");
+    const before = await workspace.capture([root], "session", "unborn", "before");
+    await Bun.write(path.join(root, "file.txt"), "v2\n");
+    await $`git add file.txt`.cwd(root).quiet();
+    const after = await workspace.capture([root], "session", "unborn", "after");
+
+    const [delta] = await workspace.deltas(before, after);
+    await workspace.restoreAllPaths([delta!], "before");
+    expect(await Bun.file(path.join(root, "file.txt")).text()).toBe("v1\n");
+    await workspace.restoreAllPaths([delta!], "after");
+    expect(await Bun.file(path.join(root, "file.txt")).text()).toBe("v2\n");
+    expect(await head(root)).toBe("HEAD");
+  });
+
+  it("round-trips symlink targets securely", async () => {
+    const root = await repository({ "target1.txt": "t1", "target2.txt": "t2" });
+    await fs.symlink("target1.txt", path.join(root, "link"));
+    await $`git add link && git commit -m link`.cwd(root).quiet();
+
+    const workspace = history(root);
+    const before = await workspace.capture([root], "session", "symlink", "before");
+    await fs.rm(path.join(root, "link"));
+    await fs.symlink("target2.txt", path.join(root, "link"));
+    const after = await workspace.capture([root], "session", "symlink", "after");
+
+    const [delta] = await workspace.deltas(before, after);
+    await workspace.restoreAllPaths([delta!], "before");
+    expect(await fs.readlink(path.join(root, "link"))).toBe("target1.txt");
+    await workspace.restoreAllPaths([delta!], "after");
+    expect(await fs.readlink(path.join(root, "link"))).toBe("target2.txt");
+  });
+
+  it("gracefully refuses to capture snapshots during a mid-merge conflict state", async () => {
+    const root = await repository({ "conflict.txt": "base\n" });
+    await $`git checkout -b feature`.cwd(root).quiet();
+    await Bun.write(path.join(root, "conflict.txt"), "feature\n");
+    await $`git commit -am feature`.cwd(root).quiet();
+    await $`git checkout main`.cwd(root).quiet();
+    await Bun.write(path.join(root, "conflict.txt"), "main\n");
+    await $`git commit -am main`.cwd(root).quiet();
+
+    // Trigger conflict
+    const merge = await exec("git", ["merge", "feature"], { cwd: root });
+    expect(merge.code).not.toBe(0); // Conflict occurred
+
+    const workspace = history(root);
+    // It should reject capture because 'git write-tree' throws on unmerged index
+    await expect(workspace.capture([root], "session", "merge", "before")).rejects.toThrow();
+  });
+
+  it("round-trips capitalization path changes (case-insensitive rename behavior)", async () => {
+    const root = await repository({ "File.txt": "v1" });
+    const workspace = history(root);
+
+    const before = await workspace.capture([root], "session", "case", "before");
+    await $`git mv File.txt file.txt`.cwd(root).quiet();
+    await Bun.write(path.join(root, "file.txt"), "v2");
+    const after = await workspace.capture([root], "session", "case", "after");
+
+    const [delta] = await workspace.deltas(before, after);
+    expect(delta!.changedPaths.sort()).toEqual(["File.txt", "file.txt"].sort());
+
+    await workspace.restoreAllPaths([delta!], "before");
+    expect(await Bun.file(path.join(root, "File.txt")).text()).toBe("v1");
+    expect(await Bun.file(path.join(root, "file.txt")).exists()).toBe(false);
+
+    await workspace.restoreAllPaths([delta!], "after");
+    expect(await Bun.file(path.join(root, "file.txt")).text()).toBe("v2");
+    expect(await Bun.file(path.join(root, "File.txt")).exists()).toBe(false);
+  });
 });

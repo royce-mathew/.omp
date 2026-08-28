@@ -315,8 +315,8 @@ async function resolveRepository(
     {},
     true,
   );
-  if (symbolicHead.code !== 0) return null;
   const head = await run(pi, repositoryRoot, ["rev-parse", "HEAD"], {}, true);
+  if (symbolicHead.code !== 0 && head.code !== 0) return null;
   const headState = head.code === 0 && head.stdout.trim()
     ? head.stdout.trim()
     : `unborn:${symbolicHead.stdout.trim()}`;
