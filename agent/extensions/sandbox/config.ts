@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
+import { parse, stringify } from "yaml";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -184,12 +185,12 @@ export function mergeConfigLayers(
   };
 }
 
-async function readJsonConfig(path: string): Promise<SandboxConfigFile> {
+async function readYamlConfig(path: string): Promise<SandboxConfigFile> {
   if (!existsSync(path)) return {};
   try {
-    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+    const parsed: unknown = parse(await readFile(path, "utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("configuration must be a JSON object");
+      throw new Error("configuration must be a YAML object");
     }
     return parsed as SandboxConfigFile;
   } catch (error) {
@@ -225,18 +226,23 @@ export function ensureGlobalConfigTemplate(): void {
         }
       };
       // JSON doesn't support comments, so we write a custom formatted string
-      const jsonContent = `{
-  "_comment_1": "Global Oh My Pi Sandbox Configuration",
-  "_comment_2": "These grants punch holes in the sandbox globally across all your projects.",
-  "_comment_3": "To allow reading global git credentials inside the sandbox, add '~/.gitconfig' and '~/.config/git' to readPaths.",
-  "grants": {
-    "readPaths": [],
-    "writePaths": [],
-    "domains": []
-  }
-}
+      const yamlContent = `# Global Oh My Pi Sandbox Configuration
+# These grants punch holes in the sandbox globally across all your projects.
+
+grants:
+  # Allow reading global credentials and configs inside the sandbox
+  readPaths:
+    # Uncomment to allow agents to read your global git config:
+    # - ~/.gitconfig
+    # - ~/.config/git
+
+  # Allow writing to specific global paths (use sparingly)
+  writePaths: []
+
+  # Allow network access to specific domains
+  domains: []
 `;
-      writeFileSync(globalPath, jsonContent, "utf8");
+      writeFileSync(globalPath, yamlContent, "utf8");
     } catch (error) {
       // Ignore if we can't write it (e.g. read-only install)
     }
@@ -245,8 +251,8 @@ export function ensureGlobalConfigTemplate(): void {
 
 export function getConfigPaths(cwd: string): { globalPath: string; projectPath: string } {
   return {
-    globalPath: join(process.env.PI_CODING_AGENT_DIR ?? getAgentDir(), "sandbox.json"),
-    projectPath: join(cwd, ".omp", "sandbox.json"),
+    globalPath: join(process.env.PI_CODING_AGENT_DIR ?? getAgentDir(), "sandbox.yaml"),
+    projectPath: join(cwd, ".omp", "sandbox.yaml"),
   };
 }
 
@@ -291,8 +297,8 @@ function validateConfig(config: SandboxConfig): SandboxConfig {
 export async function loadConfig(cwd: string, includeProject = true): Promise<SandboxConfig> {
   const { globalPath, projectPath } = getConfigPaths(cwd);
   const [globalConfig, projectConfig] = await Promise.all([
-    readJsonConfig(globalPath),
-    includeProject ? readJsonConfig(projectPath) : Promise.resolve({}),
+    readYamlConfig(globalPath),
+    includeProject ? readYamlConfig(projectPath) : Promise.resolve({}),
   ]);
   return validateConfig(mergeConfigLayers(
     DEFAULT_CONFIG,
@@ -309,12 +315,12 @@ async function updateConfig(
 ): Promise<void> {
   const previous = saveQueues.get(path) ?? Promise.resolve();
   const task = previous.catch(() => undefined).then(async () => {
-    const config = await readJsonConfig(path);
+    const config = await readYamlConfig(path);
     update(config);
     await mkdir(dirname(path), { recursive: true });
     const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+      await writeFile(temporaryPath, `${stringify(config)}\n`, "utf8");
       await rename(temporaryPath, path);
     } finally {
       await rm(temporaryPath, { force: true });

@@ -1,3 +1,4 @@
+import { stringify, parse } from "yaml";
 import { mkdtempSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -81,15 +82,15 @@ describe("sandbox configuration", () => {
   test("uses OMP's configured agent and project config directories", () => {
     process.env.PI_CODING_AGENT_DIR = "/tmp/custom-agent";
     expect(getConfigPaths("/workspace")).toEqual({
-      globalPath: "/tmp/custom-agent/sandbox.json",
-      projectPath: "/workspace/.omp/sandbox.json",
+      globalPath: "/tmp/custom-agent/sandbox.yaml",
+      projectPath: "/workspace/.omp/sandbox.yaml",
     });
   });
 
   test("rejects malformed runtime configuration at the load boundary", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-sandbox-invalid-"));
     process.env.PI_CODING_AGENT_DIR = root;
-    await writeFile(join(root, "sandbox.json"), JSON.stringify({
+    await writeFile(join(root, "sandbox.yaml"), stringify({
       network: { strictAllowlist: "yes" },
     }));
     await expect(loadConfig(root, false)).rejects.toThrow("invalid sandbox configuration");
@@ -97,7 +98,7 @@ describe("sandbox configuration", () => {
 
   test("fails closed instead of replacing malformed configuration during a grant", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-sandbox-malformed-"));
-    const path = join(root, "sandbox.json");
+    const path = join(root, "sandbox.yaml");
     await writeFile(path, "{ malformed");
     await expect(addReadPathToConfig(path, "/read")).rejects.toThrow(
       "could not read sandbox configuration",
@@ -108,13 +109,13 @@ describe("sandbox configuration", () => {
   test("atomically preserves independently added permission rules", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-sandbox-config-"));
     process.env.PI_CODING_AGENT_DIR = root;
-    const path = join(root, "sandbox.json");
+    const path = join(root, "sandbox.yaml");
     await Promise.all([
       addReadPathToConfig(path, "/read"),
       addWritePathToConfig(path, "/write"),
       addDomainToConfig(path, "example.test"),
     ]);
-    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({
+    expect(parse(await readFile(path, "utf8"))).toEqual({
       grants: {
         domains: ["example.test"],
         readPaths: ["/read"],
@@ -132,7 +133,7 @@ describe("sandbox configuration", () => {
     if (process.platform !== "linux") return;
     const root = mkdtempSync(join(tmpdir(), "pi-sandbox-legacy-"));
     process.env.PI_CODING_AGENT_DIR = root;
-    await writeFile(join(root, "sandbox.json"), JSON.stringify({
+    await writeFile(join(root, "sandbox.yaml"), stringify({
       filesystem: { denyWrite: [".env", ".env.*", "*.pem", "*.key"] },
     }));
     const config = await loadConfig(root, false);

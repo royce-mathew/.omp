@@ -191,7 +191,7 @@ export function registerSandboxBashTool(
   pi.registerTool({
     name: "bash",
     label: "Bash",
-    description: "Execute a foreground shell command. When sandboxing is enabled, filesystem and network access follow sandbox.json.",
+    description: "Execute a foreground shell command. When sandboxing is enabled, filesystem and network access follow sandbox.yaml.",
     parameters,
     approval: "exec",
     loadMode: "essential",
