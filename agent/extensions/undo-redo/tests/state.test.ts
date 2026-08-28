@@ -1,8 +1,12 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import {
   CHECKPOINT_TYPE,
   CURSOR_TYPE,
+  loadPosition,
   reconstructState,
   UNAVAILABLE_TYPE,
   type TurnCheckpointV2,
@@ -38,10 +42,15 @@ function checkpoint(id: string): TurnCheckpointV2 {
   };
 }
 
-function custom(id: string, customType: string, data: unknown): SessionEntry {
+function custom(
+  id: string,
+  customType: string,
+  data: unknown,
+  parentId: string | null = null,
+): SessionEntry {
   return {
     id,
-    parentId: null,
+    parentId,
     type: "custom",
     timestamp: "2026-08-26T00:00:00.000Z",
     customType,
@@ -94,6 +103,147 @@ describe("v2 undo state reconstruction", () => {
         async () => source,
       ),
     ).rejects.toThrow("does not target the final applied turn");
+  });
+
+  it("orders one, two, and three nested undos as a LIFO redo stack", async () => {
+    const first = checkpoint("first");
+    const second = checkpoint("second");
+    const third = checkpoint("third");
+    const base = [
+      custom("first", CHECKPOINT_TYPE, first),
+      custom("second", CHECKPOINT_TYPE, second, "first"),
+      custom("third", CHECKPOINT_TYPE, third, "second"),
+    ];
+    const firstUndo = [
+      custom("undo-third", CURSOR_TYPE, {
+        version: 2,
+        kind: "undo",
+        turnId: third.id,
+        source: { sessionFile: "/sessions/base.jsonl", leafId: "third" },
+      }),
+    ];
+    const secondUndo = [
+      custom("undo-second", CURSOR_TYPE, {
+        version: 2,
+        kind: "undo",
+        turnId: second.id,
+        source: { sessionFile: "/sessions/undo-third.jsonl", leafId: "undo-third" },
+      }),
+    ];
+    const state = await reconstructState(
+      [
+        custom("undo-first", CURSOR_TYPE, {
+          version: 2,
+          kind: "undo",
+          turnId: first.id,
+          source: { sessionFile: "/sessions/undo-second.jsonl", leafId: "undo-second" },
+        }),
+      ],
+      async ({ sessionFile }) => {
+        if (sessionFile.endsWith("base.jsonl")) return base;
+        if (sessionFile.endsWith("undo-third.jsonl")) return firstUndo;
+        if (sessionFile.endsWith("undo-second.jsonl")) return secondUndo;
+        throw new Error(`Unexpected source: ${sessionFile}`);
+      },
+    );
+
+    expect(state.applied).toEqual([]);
+    expect(state.redo.map(({ turn }) => turn.id)).toEqual([
+      "third",
+      "second",
+      "first",
+    ]);
+    expect(state.redo.at(-1)?.target).toEqual({
+      sessionFile: "/sessions/undo-second.jsonl",
+      leafId: "undo-second",
+    });
+  });
+
+  it("clears redo when a new checkpoint follows a truncate cursor", async () => {
+    const first = checkpoint("first");
+    const second = checkpoint("second");
+    const replacement = checkpoint("replacement");
+    const source = [
+      custom("first", CHECKPOINT_TYPE, first),
+      custom("second", CHECKPOINT_TYPE, second, "first"),
+    ];
+    const state = await reconstructState(
+      [
+        custom("undo-second", CURSOR_TYPE, {
+          version: 2,
+          kind: "undo",
+          turnId: second.id,
+          source: { sessionFile: "/sessions/source.jsonl", leafId: "second" },
+        }),
+        custom("truncate", CURSOR_TYPE, { version: 2, kind: "truncate" }, "undo-second"),
+        custom("replacement", CHECKPOINT_TYPE, replacement, "truncate"),
+      ],
+      async () => source,
+    );
+
+    expect(state.applied.map(({ id }) => id)).toEqual(["first", "replacement"]);
+    expect(state.redo).toEqual([]);
+  });
+
+  it("fails closed for malformed events, nested cursor cycles, and missing sources", async () => {
+    await expect(
+      reconstructState([custom("bad-checkpoint", CHECKPOINT_TYPE, { version: 2 })]),
+    ).rejects.toThrow("Malformed undo checkpoint");
+    await expect(
+      reconstructState([custom("bad-cursor", CURSOR_TYPE, { version: 2, kind: "redo" })]),
+    ).rejects.toThrow("Malformed undo cursor");
+
+    const cyclic = custom("cycle", CURSOR_TYPE, {
+      version: 2,
+      kind: "undo",
+      turnId: "turn",
+      source: { sessionFile: "/sessions/cycle.jsonl", leafId: "cycle" },
+    });
+    await expect(
+      reconstructState([cyclic], async () => [cyclic]),
+    ).rejects.toThrow("Undo cursor cycle");
+
+    await expect(
+      loadPosition({ sessionFile: "/missing/undo-redo-session.jsonl", leafId: null }),
+    ).rejects.toThrow("Persisted session is missing");
+  });
+
+  it("fails closed when a persisted position names a missing leaf", async () => {
+    const root = await fs.mkdtemp("/tmp/omp-undo-redo-state-");
+    const sessions = path.join(root, "sessions");
+    try {
+      const manager = SessionManager.create(root, sessions);
+      manager.appendMessage({
+        role: "user",
+        content: "persisted",
+        timestamp: Date.now(),
+      });
+      manager.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "persisted" }],
+        api: "anthropic-messages",
+        provider: "anthropic",
+        model: "test",
+        usage: {
+          input: 1,
+          output: 1,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 2,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      });
+      await manager.flush();
+      const sessionFile = manager.getSessionFile();
+      expect(sessionFile).toBeDefined();
+      await expect(
+        loadPosition({ sessionFile: sessionFile!, leafId: "missing-leaf" }),
+      ).rejects.toThrow("Missing session leaf");
+    } finally {
+      await fs.rm(root, { force: true, recursive: true });
+    }
   });
 
   it("treats an unavailable capture as a hard history barrier", async () => {
