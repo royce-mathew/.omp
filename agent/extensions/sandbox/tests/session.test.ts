@@ -1,3 +1,4 @@
+import { stringify } from "yaml";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -44,7 +45,7 @@ test("retries configuration reads after a cached failure", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-sandbox-config-retry-"));
   temporaryPaths.push(root);
   process.env.PI_CODING_AGENT_DIR = root;
-  const path = join(root, "sandbox.json");
+  const path = join(root, "sandbox.yaml");
   const session = new SandboxSession();
   const ctx = configContext(root);
 
@@ -58,13 +59,13 @@ test("reloads successful configuration snapshots explicitly", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-sandbox-config-reload-"));
   temporaryPaths.push(root);
   process.env.PI_CODING_AGENT_DIR = root;
-  const path = join(root, "sandbox.json");
+  const path = join(root, "sandbox.yaml");
   const session = new SandboxSession();
   const ctx = configContext(root);
 
-  writeFileSync(path, JSON.stringify({ enabled: false }));
+  writeFileSync(path, stringify({ enabled: false }));
   await expect(session.config(ctx)).resolves.toMatchObject({ enabled: false });
-  writeFileSync(path, JSON.stringify({ enabled: true }));
+  writeFileSync(path, stringify({ enabled: true }));
   await expect(session.reloadConfig(ctx)).resolves.toMatchObject({ enabled: true });
 });
 
