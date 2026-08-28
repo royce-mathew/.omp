@@ -2,9 +2,9 @@ import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-ent
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import type { WorkspaceSnapshot } from "./git.ts";
 
-export const CHECKPOINT_TYPE = "omp.undo-redo.checkpoint.v2";
-export const CURSOR_TYPE = "omp.undo-redo.cursor.v2";
-export const UNAVAILABLE_TYPE = "omp.undo-redo.unavailable.v2";
+export const CHECKPOINT_TYPE = "omp.undo-redo.checkpoint";
+export const CURSOR_TYPE = "omp.undo-redo.cursor";
+export const UNAVAILABLE_TYPE = "omp.undo-redo.unavailable";
 export const RECONSTRUCTION_DEPTH_LIMIT = 128;
 
 export interface SessionPosition {
@@ -20,8 +20,7 @@ export interface WorkspaceDelta {
   changedPaths: string[];
 }
 
-export interface TurnCheckpointV2 {
-  version: 2;
+export interface TurnCheckpoint {
   id: string;
   rootSessionId: string;
   userEntryId: string;
@@ -31,16 +30,16 @@ export interface TurnCheckpointV2 {
   workspaces: WorkspaceDelta[];
 }
 
-export type CursorEventV2 =
-  | { version: 2; kind: "undo"; turnId: string; source: SessionPosition }
-  | { version: 2; kind: "truncate" };
+export type CursorEvent =
+  | { kind: "undo"; turnId: string; source: SessionPosition }
+  | { kind: "truncate" };
 
 export interface RedoTarget {
-  turn: TurnCheckpointV2;
+  turn: TurnCheckpoint;
   target: SessionPosition;
 }
 export interface ResolvedState {
-  applied: TurnCheckpointV2[];
+  applied: TurnCheckpoint[];
   redo: RedoTarget[];
   expectedHeads: Map<string, string>;
   barrier: boolean;
@@ -190,12 +189,11 @@ export function isSessionPosition(value: unknown): value is SessionPosition {
     (nonEmptyString(position.leafId) || position.leafId === null);
 }
 
-export function isCheckpoint(value: unknown): value is TurnCheckpointV2 {
+export function isCheckpoint(value: unknown): value is TurnCheckpoint {
   const checkpoint = record(value);
   if (
     !checkpoint ||
     !exactKeys(checkpoint, [
-      "version",
       "id",
       "rootSessionId",
       "userEntryId",
@@ -204,7 +202,6 @@ export function isCheckpoint(value: unknown): value is TurnCheckpointV2 {
       "createdAt",
       "workspaces",
     ]) ||
-    checkpoint.version !== 2 ||
     !nonEmptyString(checkpoint.id) ||
     !nonEmptyString(checkpoint.rootSessionId) ||
     !nonEmptyString(checkpoint.userEntryId) ||
@@ -219,14 +216,14 @@ export function isCheckpoint(value: unknown): value is TurnCheckpointV2 {
   return uniquePaths(identities);
 }
 
-export function isCursorEvent(value: unknown): value is CursorEventV2 {
+export function isCursorEvent(value: unknown): value is CursorEvent {
   const cursor = record(value);
-  if (!cursor || cursor.version !== 2 || typeof cursor.kind !== "string") return false;
+  if (!cursor || typeof cursor.kind !== "string") return false;
   if (cursor.kind === "truncate") {
-    return exactKeys(cursor, ["version", "kind"]);
+    return exactKeys(cursor, ["kind"]);
   }
   return cursor.kind === "undo" &&
-    exactKeys(cursor, ["version", "kind", "turnId", "source"]) &&
+    exactKeys(cursor, ["kind", "turnId", "source"]) &&
     nonEmptyString(cursor.turnId) &&
     isSessionPosition(cursor.source);
 }
@@ -241,13 +238,13 @@ function cloneState(state?: ResolvedState): ResolvedState {
     : { applied: [], redo: [], expectedHeads: new Map(), barrier: false };
 }
 
-function updateHeads(state: ResolvedState, turn: TurnCheckpointV2): void {
+function updateHeads(state: ResolvedState, turn: TurnCheckpoint): void {
   for (const workspace of turn.workspaces) {
     state.expectedHeads.set(workspaceIdentity(workspace), workspace.after.head);
   }
 }
 
-function appendCheckpoint(state: ResolvedState, turn: TurnCheckpointV2): void {
+function appendCheckpoint(state: ResolvedState, turn: TurnCheckpoint): void {
   if (state.applied.some((candidate) => candidate.id === turn.id)) {
     throw new StateReconstructionError(`Duplicate undo checkpoint: ${turn.id}`);
   }

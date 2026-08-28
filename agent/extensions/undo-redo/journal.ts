@@ -12,7 +12,6 @@ import {
 import type { WorkspaceSnapshot } from "./git.ts";
 
 export interface TransitionJournal {
-  version: 1;
   rootSessionId: string;
   direction: "undo" | "redo";
   turnId: string;
@@ -74,10 +73,9 @@ function isJournal(value: unknown): value is TransitionJournal {
   if (!value || typeof value !== "object") return false;
   const journal = value as Record<string, unknown>;
   if (
-    Object.keys(journal).length !== 9 ||
+    Object.keys(journal).length !== 8 ||
     !Object.keys(journal).every((key) =>
       [
-        "version",
         "rootSessionId",
         "direction",
         "turnId",
@@ -88,7 +86,6 @@ function isJournal(value: unknown): value is TransitionJournal {
         "phase",
       ].includes(key)
     ) ||
-    journal.version !== 1 ||
     !validIdentifier(journal.rootSessionId) ||
     (journal.direction !== "undo" && journal.direction !== "redo") ||
     !validIdentifier(journal.turnId) ||

@@ -12,7 +12,7 @@ import { $ } from "bun";
 import { WorkspaceHistory } from "../git.ts";
 import { readJournal, writeJournal } from "../journal.ts";
 import { createUndoRedoExtension } from "../index.ts";
-import type { TurnCheckpointV2 } from "../state.ts";
+import type { TurnCheckpoint } from "../state.ts";
 
 interface RegisteredExtension {
   handlers: Map<
@@ -291,7 +291,7 @@ describe("local undo redo extension", () => {
         .some(
           (entry) =>
             entry.type === "custom" &&
-            entry.customType === "omp.undo-redo.checkpoint.v2",
+            entry.customType === "omp.undo-redo.checkpoint",
         ),
     ).toBe(true);
 
@@ -615,7 +615,7 @@ describe("local undo redo extension", () => {
     const sourceFile = manager.getSessionFile();
     const sourceLeaf = manager.getLeafId();
     const checkpoints = manager.getEntries().filter(
-      (entry) => entry.type === "custom" && entry.customType === "omp.undo-redo.checkpoint.v2",
+      (entry) => entry.type === "custom" && entry.customType === "omp.undo-redo.checkpoint",
     );
     expect(checkpoints).toHaveLength(4);
     expect(checkpoints.map((entry) => {
@@ -891,12 +891,12 @@ describe("local undo redo extension", () => {
       await Bun.write(path.join(root, "tracked.txt"), "turn\n");
     });
     const checkpointEntry = manager.getEntries().find(
-      (entry) => entry.type === "custom" && entry.customType === "omp.undo-redo.checkpoint.v2",
+      (entry) => entry.type === "custom" && entry.customType === "omp.undo-redo.checkpoint",
     );
     if (!checkpointEntry || checkpointEntry.type !== "custom") {
       throw new Error("Expected a durable checkpoint.");
     }
-    const checkpoint = checkpointEntry.data as TurnCheckpointV2;
+    const checkpoint = checkpointEntry.data as TurnCheckpoint;
     const rootSessionId = checkpoint.rootSessionId;
     const position = {
       sessionFile: manager.getSessionFile()!,
@@ -919,7 +919,6 @@ describe("local undo redo extension", () => {
         "rollback",
       );
       await writeJournal(dataDir, rootSessionId, {
-        version: 1,
         rootSessionId,
         direction: "undo",
         turnId: checkpoint.id,
@@ -956,7 +955,6 @@ describe("local undo redo extension", () => {
         after: { ...workspace.after, refName: "refs/omp/undo/missing-recovery-ref" },
       }));
       await writeJournal(dataDir, rootSessionId, {
-        version: 1,
         rootSessionId,
         direction: "undo",
         turnId: checkpoint.id,

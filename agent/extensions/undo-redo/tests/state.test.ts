@@ -9,9 +9,9 @@ import {
   loadPosition,
   reconstructState,
   UNAVAILABLE_TYPE,
-  type TurnCheckpointV2,
+  type TurnCheckpoint,
 } from "../state.ts";
-function checkpoint(id: string): TurnCheckpointV2 {
+function checkpoint(id: string): TurnCheckpoint {
   const snapshot = {
     repositoryRoot: "/workspace",
     commonDir: "/workspace/.git",
@@ -23,7 +23,7 @@ function checkpoint(id: string): TurnCheckpointV2 {
     excludedPaths: [],
   };
   return {
-    version: 2,
+    
     id,
     rootSessionId: "main",
     userEntryId: `user-${id}`,
@@ -58,14 +58,14 @@ function custom(
   } as unknown as SessionEntry;
 }
 
-describe("v2 undo state reconstruction", () => {
+describe("undo state reconstruction", () => {
   it("reconstructs redo from its exact source position", async () => {
     const first = checkpoint("first");
     const source = [custom("checkpoint", CHECKPOINT_TYPE, first)];
     const state = await reconstructState(
       [
         custom("cursor", CURSOR_TYPE, {
-          version: 2,
+          
           kind: "undo",
           turnId: first.id,
           source: { sessionFile: "/sessions/source.jsonl", leafId: "checkpoint" },
@@ -82,11 +82,11 @@ describe("v2 undo state reconstruction", () => {
     });
   });
 
-  it("ignores v1 records and rejects a cursor targeting another turn", async () => {
+  it("rejects a cursor targeting another turn", async () => {
     const first = checkpoint("first");
     const source = [custom("checkpoint", CHECKPOINT_TYPE, first)];
     const ignored = await reconstructState([
-      custom("legacy", "omp.undo-redo.state", { version: 1, undo: [first], redo: [] }),
+      custom("legacy", "omp.undo-redo.state", {  undo: [first], redo: [] }),
     ]);
     expect(ignored.applied).toEqual([]);
 
@@ -94,7 +94,7 @@ describe("v2 undo state reconstruction", () => {
       reconstructState(
         [
           custom("cursor", CURSOR_TYPE, {
-            version: 2,
+            
             kind: "undo",
             turnId: "other",
             source: { sessionFile: "/sessions/source.jsonl", leafId: "checkpoint" },
@@ -116,7 +116,7 @@ describe("v2 undo state reconstruction", () => {
     ];
     const firstUndo = [
       custom("undo-third", CURSOR_TYPE, {
-        version: 2,
+        
         kind: "undo",
         turnId: third.id,
         source: { sessionFile: "/sessions/base.jsonl", leafId: "third" },
@@ -124,7 +124,7 @@ describe("v2 undo state reconstruction", () => {
     ];
     const secondUndo = [
       custom("undo-second", CURSOR_TYPE, {
-        version: 2,
+        
         kind: "undo",
         turnId: second.id,
         source: { sessionFile: "/sessions/undo-third.jsonl", leafId: "undo-third" },
@@ -133,7 +133,7 @@ describe("v2 undo state reconstruction", () => {
     const state = await reconstructState(
       [
         custom("undo-first", CURSOR_TYPE, {
-          version: 2,
+          
           kind: "undo",
           turnId: first.id,
           source: { sessionFile: "/sessions/undo-second.jsonl", leafId: "undo-second" },
@@ -170,12 +170,12 @@ describe("v2 undo state reconstruction", () => {
     const state = await reconstructState(
       [
         custom("undo-second", CURSOR_TYPE, {
-          version: 2,
+          
           kind: "undo",
           turnId: second.id,
           source: { sessionFile: "/sessions/source.jsonl", leafId: "second" },
         }),
-        custom("truncate", CURSOR_TYPE, { version: 2, kind: "truncate" }, "undo-second"),
+        custom("truncate", CURSOR_TYPE, {  kind: "truncate" }, "undo-second"),
         custom("replacement", CHECKPOINT_TYPE, replacement, "truncate"),
       ],
       async () => source,
@@ -190,11 +190,11 @@ describe("v2 undo state reconstruction", () => {
       reconstructState([custom("bad-checkpoint", CHECKPOINT_TYPE, { version: 2 })]),
     ).rejects.toThrow("Malformed undo checkpoint");
     await expect(
-      reconstructState([custom("bad-cursor", CURSOR_TYPE, { version: 2, kind: "redo" })]),
+      reconstructState([custom("bad-cursor", CURSOR_TYPE, {  kind: "redo" })]),
     ).rejects.toThrow("Malformed undo cursor");
 
     const cyclic = custom("cycle", CURSOR_TYPE, {
-      version: 2,
+      
       kind: "undo",
       turnId: "turn",
       source: { sessionFile: "/sessions/cycle.jsonl", leafId: "cycle" },
@@ -248,7 +248,7 @@ describe("v2 undo state reconstruction", () => {
 
   it("treats an unavailable capture as a hard history barrier", async () => {
     const state = await reconstructState([
-      custom("unavailable", UNAVAILABLE_TYPE, { version: 2, reason: "snapshot limit" }),
+      custom("unavailable", UNAVAILABLE_TYPE, {  reason: "snapshot limit" }),
     ]);
     expect(state.barrier).toBe(true);
     expect(state.applied).toEqual([]);
