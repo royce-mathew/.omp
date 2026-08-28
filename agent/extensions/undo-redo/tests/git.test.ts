@@ -314,7 +314,6 @@ describe("WorkspaceHistory selective snapshots", () => {
       [...before, ...after],
     );
     await writeJournal(dataDir, "root", {
-      version: 1,
       rootSessionId: "root",
       direction: "undo",
       turnId: "protected",

@@ -25,7 +25,7 @@ import {
   workspaceIdentity,
   type ResolvedState,
   type SessionPosition,
-  type TurnCheckpointV2,
+  type TurnCheckpoint,
 } from "./state.ts";
 
 const SCOPE_WARNING =
@@ -124,14 +124,14 @@ function notifyFailure(
   ctx.ui.notify(message, error ? "error" : "warning");
 }
 
-function allSnapshots(turn: TurnCheckpointV2): WorkspaceSnapshot[] {
+function allSnapshots(turn: TurnCheckpoint): WorkspaceSnapshot[] {
   return turn.workspaces.flatMap((workspace) => [workspace.before, workspace.after]);
 }
 
 async function restoreRollback(
   workspace: WorkspaceHistory,
   rollback: readonly WorkspaceSnapshot[],
-  turn: Pick<TurnCheckpointV2, "workspaces">,
+  turn: Pick<TurnCheckpoint, "workspaces">,
 ): Promise<void> {
   for (const delta of turn.workspaces) {
     const snapshot = rollback.find(
@@ -179,7 +179,7 @@ export function createUndoRedoExtension(
 
   const excludedPathsNotice = (
     ctx: ExtensionCommandContext,
-    turn: TurnCheckpointV2,
+    turn: TurnCheckpoint,
   ): void => {
     const exclusions = new Set<string>();
     for (const workspaceRecord of turn.workspaces) {
@@ -366,7 +366,6 @@ export function createUndoRedoExtension(
       let after: WorkspaceSnapshot[] = [];
       try {
         if (active.truncatesRedo) {
-          await appendDurably(ctx, CURSOR_TYPE, { version: 2, kind: "truncate" });
         }
         if (active.unavailableReason) throw new Error(active.unavailableReason);
         after = await workspace.capture(
@@ -376,8 +375,7 @@ export function createUndoRedoExtension(
           "after",
         );
         const workspaces = await workspace.deltas(active.before, after);
-        const checkpoint: TurnCheckpointV2 = {
-          version: 2,
+        const checkpoint: TurnCheckpoint = {
           id: active.id,
           rootSessionId: rootSessionId || active.sourceSessionId,
           userEntryId: userEntry.id,
@@ -398,7 +396,6 @@ export function createUndoRedoExtension(
         unavailableMessage = error instanceof Error ? error.message : String(error);
         try {
           await appendDurably(ctx, UNAVAILABLE_TYPE, {
-            version: 2,
             reason: unavailableMessage,
             userEntryId: userEntry.id,
           });
@@ -450,7 +447,7 @@ export function createUndoRedoExtension(
   const compatibleRedoState = (
     current: ResolvedState,
     target: ResolvedState,
-    turn: TurnCheckpointV2,
+    turn: TurnCheckpoint,
   ): boolean =>
     target.applied.length === current.applied.length + 1 &&
     target.applied.every((candidate, index) =>
@@ -474,7 +471,7 @@ export function createUndoRedoExtension(
     direction: "undo" | "redo",
     original: SessionPosition,
     rollback: readonly WorkspaceSnapshot[],
-    turn: TurnCheckpointV2,
+    turn: TurnCheckpoint,
     workspaceRestoreStarted: boolean,
     transcriptTransitioned: boolean,
   ): Promise<string | undefined> => {
@@ -600,7 +597,7 @@ export function createUndoRedoExtension(
   const preflight = async (
     ctx: ExtensionCommandContext,
     side: "before" | "after",
-  ): Promise<{ state: ResolvedState; turn: TurnCheckpointV2; lineage: string } | undefined> => {
+  ): Promise<{ state: ResolvedState; turn: TurnCheckpoint; lineage: string } | undefined> => {
     if (ctx.mode !== "tui") {
       notifyFailure(ctx, "Undo and redo are available only in an interactive root session.");
       return undefined;
@@ -722,7 +719,6 @@ export function createUndoRedoExtension(
         "rollback",
       );
       journal = {
-        version: 1,
         rootSessionId: lineage,
         direction: "undo",
         turnId: turn.id,
@@ -734,7 +730,6 @@ export function createUndoRedoExtension(
       };
       await writeJournal(dataDir, lineage, journal);
       const cursor = {
-        version: 2 as const,
         kind: "undo" as const,
         turnId: turn.id,
         source: original,
@@ -837,7 +832,6 @@ export function createUndoRedoExtension(
         "rollback",
       );
       journal = {
-        version: 1,
         rootSessionId: lineage,
         direction: "redo",
         turnId: turn.id,

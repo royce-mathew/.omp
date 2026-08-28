@@ -1,6 +1,6 @@
 # Undo-Redo Extension
 
-This extension manages the `v2` undo/redo state machine and atomic Git snapshotting for Oh My Pi. 
+This extension manages the undo/redo state machine and atomic Git snapshotting for Oh My Pi. 
 
 It is designed to operate safely in an asynchronous, crash-prone environment where human developers and background subagents are concurrently modifying the workspace.
 
@@ -10,8 +10,8 @@ The extension is split across three core domains:
 
 ### 1. Persistent State Model (`state.ts`)
 Rather than relying on mutable `undo[]` and `redo[]` arrays in memory (which are vulnerable to data loss during process crashes), history is tracked via an **append-only event stream**:
-* **Checkpoints (`omp.undo-redo.checkpoint.v2`):** Recorded exactly once when a parent turn finishes. They contain the before/after Git hashes (`indexTree`, `worktreeTree`) and an explicit array of `changedPaths`.
-* **Cursors (`omp.undo-redo.cursor.v2`):** Executing `/undo` appends a Cursor event rather than deleting a Checkpoint. 
+* **Checkpoints (`omp.undo-redo.checkpoint`):** Recorded exactly once when a parent turn finishes. They contain the before/after Git hashes (`indexTree`, `worktreeTree`) and an explicit array of `changedPaths`.
+* **Cursors (`omp.undo-redo.cursor`):** Executing `/undo` appends a Cursor event rather than deleting a Checkpoint. 
 * **Reconstruction:** On boot, `reconstructState()` reads the stream to rebuild the active branch, evaluate the redo stack, and assert the expected sticky Git `HEAD`s.
 
 ### 2. Path-Selective Restoration (`git.ts`)
