@@ -13,7 +13,7 @@ import {
 } from "./git.ts";
 import {
   clearJournal,
-  readJournal,
+  listJournals,
   writeJournal,
   type TransitionJournal,
 } from "./journal.ts";
@@ -22,6 +22,7 @@ import {
   CURSOR_TYPE,
   reconstructState,
   UNAVAILABLE_TYPE,
+  workspaceIdentity,
   type ResolvedState,
   type SessionPosition,
   type TurnCheckpointV2,
@@ -88,18 +89,21 @@ function userText(entry: SessionEntry): { text: string; attachments: boolean } {
   return { text, attachments };
 }
 
+
 function liveRelevantSubagent(ctx: ExtensionContext): boolean {
   const registry = AgentRegistry.global();
   const refs = registry.list();
   const root = refs.find(
     (ref) =>
-      ref.kind !== "sub" &&
+      ref.kind === "main" &&
       ref.sessionFile === ctx.sessionManager.getSessionFile(),
   );
   if (!root) return false;
   const byId = new Map(refs.map((ref) => [ref.id, ref]));
   return refs.some((ref) => {
-    if (ref.kind !== "sub" || !registry.isRunning(ref)) return false;
+    const running = registry.isRunning(ref) ||
+      (ref.status === "running" && ref.session === null);
+    if (ref.kind !== "sub" || !running) return false;
     const seen = new Set<string>();
     let parentId = ref.parentId;
     while (parentId) {
@@ -127,7 +131,7 @@ function allSnapshots(turn: TurnCheckpointV2): WorkspaceSnapshot[] {
 async function restoreRollback(
   workspace: WorkspaceHistory,
   rollback: readonly WorkspaceSnapshot[],
-  turn: TurnCheckpointV2,
+  turn: Pick<TurnCheckpointV2, "workspaces">,
 ): Promise<void> {
   for (const delta of turn.workspaces) {
     const snapshot = rollback.find(
@@ -149,28 +153,90 @@ export function createUndoRedoExtension(
   let rootSessionId = "";
   let pending: PendingTurn | undefined;
   let unavailableMessage: string | undefined;
-  let lastContext: ExtensionContext | undefined;
-  const recoverJournal = async (
+  let sessionRecovery: Promise<string | undefined> = Promise.resolve(undefined);
+  let pendingFinalization: Promise<void> | undefined;
+
+  const lineageFromState = (
+    state: ResolvedState,
+    fallback: string,
+  ): string => {
+    const lineages = new Set(
+      [...state.applied, ...state.redo.map((entry) => entry.turn)]
+        .map((turn) => turn.rootSessionId),
+    );
+    if (lineages.size > 1) {
+      throw new Error("Undo history has inconsistent journal lineages.");
+    }
+    return lineages.values().next().value ?? fallback;
+  };
+
+  const samePosition = (
+    ctx: ExtensionContext,
+    position: SessionPosition,
+  ): boolean =>
+    ctx.sessionManager.getSessionFile() === position.sessionFile &&
+    ctx.sessionManager.getLeafId() === position.leafId;
+
+  const excludedPathsNotice = (
     ctx: ExtensionCommandContext,
+    turn: TurnCheckpointV2,
+  ): void => {
+    const exclusions = new Set<string>();
+    for (const workspaceRecord of turn.workspaces) {
+      for (const excludedPath of new Set([
+        ...workspaceRecord.before.excludedPaths,
+        ...workspaceRecord.after.excludedPaths,
+      ])) {
+        const name = workspaceRecord.repositoryRoot === ctx.sessionManager.getCwd()
+          ? excludedPath
+          : `${workspaceRecord.repositoryRoot}:${excludedPath}`;
+        exclusions.add(name);
+      }
+    }
+    if (exclusions.size > 0) {
+      ctx.ui.notify(
+        `Oversized untracked paths were excluded and left unchanged:\n${[...exclusions].sort().join("\n")}`,
+        "warning",
+      );
+    }
+  };
+
+  const releaseJournal = async (
+    lineage: string,
+    journal: TransitionJournal,
+  ): Promise<void> => {
+    await workspace.deleteRefs(journal.rollback);
+    await clearJournal(dataDir, lineage);
+  };
+
+  const recoveryFailure = (
+    journal: TransitionJournal,
+    originalPaths: readonly string[],
+    targetPaths: readonly string[],
+  ): string => {
+    const target = journal.target
+      ? `${journal.target.sessionFile}@${journal.target.leafId ?? "<root>"}`
+      : "<not-yet-created>";
+    const paths = [...new Set([...originalPaths, ...targetPaths])];
+    const detail = paths.length > 0 ? ` Affected paths: ${paths.join(", ")}.` : "";
+    return `Undo recovery is unresolved for ${journal.direction} of ${journal.turnId}. Manual recovery is required at ${journal.original.sessionFile}@${journal.original.leafId ?? "<root>"} or ${target}; rollback snapshots were retained.${detail}`;
+  };
+
+  const recoverJournal = async (
+    ctx: ExtensionContext,
+    lineage: string,
+    journal: TransitionJournal,
   ): Promise<string | undefined> => {
-    const lineage = rootSessionId || ctx.sessionManager.getSessionId();
-    const journal = await readJournal(dataDir, lineage);
-    if (!journal) return undefined;
     const expectedHeads = new Map(
       journal.workspaces.map((workspaceRecord) => [
-        workspaceRecord.commonDir,
+        workspaceIdentity(workspaceRecord),
         workspaceRecord.after.head,
       ]),
     );
     const originalSide = journal.direction === "undo" ? "after" : "before";
     const targetSide = journal.direction === "undo" ? "before" : "after";
-    const atOriginal =
-      ctx.sessionManager.getSessionFile() === journal.original.sessionFile &&
-      ctx.sessionManager.getLeafId() === journal.original.leafId;
-    const atTarget =
-      journal.target !== null &&
-      ctx.sessionManager.getSessionFile() === journal.target.sessionFile &&
-      ctx.sessionManager.getLeafId() === journal.target.leafId;
+    const atOriginal = samePosition(ctx, journal.original);
+    const atTarget = journal.target !== null && samePosition(ctx, journal.target);
     const originalMatches = await workspace.matchAllPaths(
       journal.workspaces,
       originalSide,
@@ -182,11 +248,10 @@ export function createUndoRedoExtension(
       expectedHeads,
     );
     if ((atOriginal && originalMatches.matches) || (atTarget && targetMatches.matches)) {
-      await workspace.deleteRefs(journal.rollback);
-      await clearJournal(dataDir, lineage);
+      await releaseJournal(lineage, journal);
       return undefined;
     }
-    if (journal.phase === "transcript-moved" && atTarget && originalMatches.matches) {
+    if (atTarget && originalMatches.matches) {
       await workspace.restoreAllPaths(journal.workspaces, targetSide);
       const restored = await workspace.matchAllPaths(
         journal.workspaces,
@@ -194,105 +259,312 @@ export function createUndoRedoExtension(
         expectedHeads,
       );
       if (restored.matches) {
-        await workspace.deleteRefs(journal.rollback);
-        await clearJournal(dataDir, lineage);
+        await releaseJournal(lineage, journal);
         return undefined;
       }
     }
-    return `Undo recovery is unresolved for ${journal.direction} of ${journal.turnId}; affected paths and rollback snapshots were retained.`;
+    if (atOriginal && targetMatches.matches) {
+      await restoreRollback(workspace, journal.rollback, journal);
+      const restored = await workspace.matchAllPaths(
+        journal.workspaces,
+        originalSide,
+        expectedHeads,
+      );
+      if (restored.matches) {
+        await releaseJournal(lineage, journal);
+        return undefined;
+      }
+    }
+    return recoveryFailure(
+      journal,
+      originalMatches.matches ? [] : originalMatches.paths,
+      targetMatches.matches ? [] : targetMatches.paths,
+    );
   };
 
-  const discardPending = async (): Promise<void> => {
-    const abandoned = pending;
-    pending = undefined;
-    if (abandoned) await workspace.deleteRefs(abandoned.before).catch(() => {});
+  const recoverForContext = async (
+    ctx: ExtensionContext,
+  ): Promise<string | undefined> => {
+    let lineage = ctx.sessionManager.getSessionId();
+    let reconstructionError: string | undefined;
+    try {
+      const state = await reconstructState(ctx.sessionManager.getBranch());
+      lineage = lineageFromState(state, lineage);
+    } catch (error) {
+      reconstructionError = error instanceof Error ? error.message : String(error);
+    }
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    const parentSession = ctx.sessionManager.getHeader()?.parentSession;
+    const candidates = (await listJournals(dataDir)).filter(({ rootSessionId, journal }) =>
+      rootSessionId === lineage ||
+      journal.original.sessionFile === sessionFile ||
+      journal.target?.sessionFile === sessionFile ||
+      journal.original.sessionFile === parentSession,
+    );
+    if (candidates.length > 1) {
+      return "Undo recovery found multiple transaction journals for this session; manual recovery is required.";
+    }
+    const [candidate] = candidates;
+    if (candidate) {
+      rootSessionId = candidate.rootSessionId;
+      return recoverJournal(ctx, candidate.rootSessionId, candidate.journal);
+    }
+    if (reconstructionError) return `Undo history is unavailable: ${reconstructionError}`;
+    rootSessionId = lineage;
+    return undefined;
   };
 
-  const initialize = (ctx: ExtensionContext): void => {
-    rootSessionId ||= ctx.sessionManager.getSessionId();
-    pending = undefined;
+  const ensureRecovered = async (
+    ctx: ExtensionContext,
+  ): Promise<string | undefined> => {
+    const startRecovery = await sessionRecovery;
+    if (startRecovery) return startRecovery;
+    return recoverForContext(ctx);
+  };
+
+
+  const initialize = (): void => {
+    rootSessionId = "";
     unavailableMessage = undefined;
-    lastContext = ctx;
+    sessionRecovery = Promise.resolve(undefined);
+  };
+
+  const ensureSessionDurable = async (ctx: ExtensionContext): Promise<void> => {
+    const manager = ctx.sessionManager as unknown;
+    if (
+      !manager ||
+      typeof manager !== "object" ||
+      !("ensureOnDisk" in manager) ||
+      typeof manager.ensureOnDisk !== "function"
+    ) {
+      throw new Error("Undo session persistence is unavailable.");
+    }
+    await manager.ensureOnDisk();
+  };
+
+  const appendDurably = async (
+    ctx: ExtensionContext,
+    customType: string,
+    data: unknown,
+  ): Promise<void> => {
+    pi.appendEntry(customType, data);
+    await ensureSessionDurable(ctx);
   };
 
   const finalizePending = async (ctx: ExtensionContext): Promise<void> => {
+    if (pendingFinalization) return pendingFinalization;
     const active = pending;
     if (!active) return;
     pending = undefined;
-    const branch = ctx.sessionManager.getBranch();
-    const userEntry = entriesAfterLeaf(branch, active.startLeafId).find(isUserEntry);
-    if (!userEntry) {
-      await workspace.deleteRefs(active.before).catch(() => {});
-      return;
-    }
-    if (active.truncatesRedo) {
-      pi.appendEntry(CURSOR_TYPE, { version: 2, kind: "truncate" });
-    }
-    if (active.unavailableReason) {
-      unavailableMessage = active.unavailableReason;
-      pi.appendEntry(UNAVAILABLE_TYPE, {
-        version: 2,
-        reason: unavailableMessage,
-        userEntryId: userEntry.id,
-      });
-      return;
-    }
+    const finalization = (async (): Promise<void> => {
+      const branch = ctx.sessionManager.getBranch();
+      const userEntry = entriesAfterLeaf(branch, active.startLeafId).find(isUserEntry);
+      if (!userEntry) {
+        await workspace.deleteRefs(active.before).catch(() => {});
+        return;
+      }
+      let after: WorkspaceSnapshot[] = [];
+      try {
+        if (active.truncatesRedo) {
+          await appendDurably(ctx, CURSOR_TYPE, { version: 2, kind: "truncate" });
+        }
+        if (active.unavailableReason) throw new Error(active.unavailableReason);
+        after = await workspace.capture(
+          roots(ctx),
+          rootSessionId || active.sourceSessionId,
+          active.id,
+          "after",
+        );
+        const workspaces = await workspace.deltas(active.before, after);
+        const checkpoint: TurnCheckpointV2 = {
+          version: 2,
+          id: active.id,
+          rootSessionId: rootSessionId || active.sourceSessionId,
+          userEntryId: userEntry.id,
+          sessionFile: active.sourceSessionFile,
+          sessionId: active.sourceSessionId,
+          createdAt: new Date().toISOString(),
+          workspaces,
+        };
+        await appendDurably(ctx, CHECKPOINT_TYPE, checkpoint);
+        await workspace.recordDurableCheckpoint(
+          checkpoint.rootSessionId,
+          checkpoint.id,
+          checkpoint.sessionFile,
+          allSnapshots(checkpoint),
+        );
+        unavailableMessage = undefined;
+      } catch (error) {
+        unavailableMessage = error instanceof Error ? error.message : String(error);
+        try {
+          await appendDurably(ctx, UNAVAILABLE_TYPE, {
+            version: 2,
+            reason: unavailableMessage,
+            userEntryId: userEntry.id,
+          });
+        } finally {
+          await workspace.deleteRefs([...active.before, ...after]).catch(() => {});
+        }
+        pi.logger.warn("Undo turn was not recorded", { error: unavailableMessage });
+      }
+    })();
+    pendingFinalization = finalization;
     try {
-      const after = await workspace.capture(
-        roots(ctx),
-        rootSessionId || active.sourceSessionId,
-        active.id,
-        "after",
-      );
-      const workspaces = await workspace.deltas(active.before, after);
-      const checkpoint: TurnCheckpointV2 = {
-        version: 2,
-        id: active.id,
-        rootSessionId: rootSessionId || active.sourceSessionId,
-        userEntryId: userEntry.id,
-        sessionFile: active.sourceSessionFile,
-        sessionId: active.sourceSessionId,
-        createdAt: new Date().toISOString(),
-        workspaces,
-      };
-      pi.appendEntry(CHECKPOINT_TYPE, checkpoint);
-      unavailableMessage = undefined;
-    } catch (error) {
-      await workspace.deleteRefs(active.before).catch(() => {});
-      unavailableMessage = error instanceof Error ? error.message : String(error);
-      pi.appendEntry(UNAVAILABLE_TYPE, {
-        version: 2,
-        reason: unavailableMessage,
-      });
-      pi.logger.warn("Undo turn was not recorded", { error: unavailableMessage });
+      await finalization;
+    } finally {
+      if (pendingFinalization === finalization) pendingFinalization = undefined;
     }
   };
 
-  pi.on("session_start", (_event, ctx) => initialize(ctx));
-  pi.on("session_switch", (_event, ctx) => initialize(ctx));
-  pi.on("session_branch", (_event, ctx) => initialize(ctx));
-  pi.on("session_tree", (_event, ctx) => initialize(ctx));
-  pi.on("session_shutdown", async () => {
-    if (lastContext) await finalizePending(lastContext);
+  const moveToPosition = async (
+    ctx: ExtensionCommandContext,
+    position: SessionPosition,
+    onTransition: () => void,
+    allowNavigation = true,
+  ): Promise<void> => {
+    const switchedSession =
+      ctx.sessionManager.getSessionFile() !== position.sessionFile;
+    if (switchedSession) {
+      const result = await ctx.switchSession(position.sessionFile);
+      if (result.cancelled) throw new Error("Session switch was cancelled.");
+      onTransition();
+    }
+    if (position.leafId === null) {
+      if (ctx.sessionManager.getLeafId() !== null) {
+        throw new Error("Session is not at its recorded root.");
+      }
+    } else if (ctx.sessionManager.getLeafId() !== position.leafId) {
+      if (!allowNavigation) {
+        throw new Error("Source session is not at its recorded transcript leaf.");
+      }
+      const result = await ctx.navigateTree(position.leafId, { summarize: false });
+      if (result.cancelled) throw new Error("Transcript navigation was cancelled.");
+      onTransition();
+    }
+    if (!samePosition(ctx, position)) {
+      throw new Error("Session is not at its recorded transcript leaf.");
+    }
+    await ensureSessionDurable(ctx);
+  };
+
+  const compatibleRedoState = (
+    current: ResolvedState,
+    target: ResolvedState,
+    turn: TurnCheckpointV2,
+  ): boolean =>
+    target.applied.length === current.applied.length + 1 &&
+    target.applied.every((candidate, index) =>
+      index === current.applied.length
+        ? candidate.id === turn.id
+        : candidate.id === current.applied[index]?.id,
+    ) &&
+    target.redo.length === current.redo.length - 1 &&
+    target.redo.every((candidate, index) =>
+      candidate.turn.id === current.redo[index]?.turn.id &&
+      candidate.target.sessionFile === current.redo[index]?.target.sessionFile &&
+      candidate.target.leafId === current.redo[index]?.target.leafId,
+    ) &&
+    target.expectedHeads.size === current.expectedHeads.size &&
+    [...target.expectedHeads].every(([repository, head]) =>
+      current.expectedHeads.get(repository) === head,
+    );
+
+  const compensate = async (
+    ctx: ExtensionCommandContext,
+    direction: "undo" | "redo",
+    original: SessionPosition,
+    rollback: readonly WorkspaceSnapshot[],
+    turn: TurnCheckpointV2,
+    workspaceRestoreStarted: boolean,
+    transcriptTransitioned: boolean,
+  ): Promise<string | undefined> => {
+    const failures: string[] = [];
+    if (workspaceRestoreStarted) {
+      try {
+        await restoreRollback(workspace, rollback, turn);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        pi.logger.error(`${direction} workspace compensation failed`, { error: detail });
+        failures.push(`workspace: ${detail}`);
+      }
+    }
+    if (transcriptTransitioned || !samePosition(ctx, original)) {
+      try {
+        await moveToPosition(ctx, original, () => {}, false);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        pi.logger.error(`${direction} transcript compensation failed`, { error: detail });
+        failures.push(`transcript: ${detail}`);
+      }
+    }
+    return failures.length > 0 ? failures.join("; ") : undefined;
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    initialize();
+    sessionRecovery = recoverForContext(ctx).catch(
+      (error) => error instanceof Error ? error.message : String(error),
+    );
+    const recoveryError = await sessionRecovery;
+    unavailableMessage = recoveryError;
+  });
+  const finalizeBeforeSessionTransition = async (
+    _event: unknown,
+    ctx: ExtensionContext,
+  ): Promise<void> => {
+    await finalizePending(ctx);
+  };
+  pi.on("session_before_switch", finalizeBeforeSessionTransition);
+  pi.on("session_before_branch", finalizeBeforeSessionTransition);
+  pi.on("session_before_tree", finalizeBeforeSessionTransition);
+  pi.on("session_switch", () => initialize());
+  pi.on("session_branch", () => initialize());
+  pi.on("session_tree", () => initialize());
+  pi.on("session_shutdown", async (_event, ctx) => {
+    await finalizePending(ctx);
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
-    lastContext = ctx;
-    if (ctx.mode !== "tui" || pending) return;
+    await finalizePending(ctx);
+    if (ctx.mode !== "tui") return;
     const sourceSessionFile = ctx.sessionManager.getSessionFile();
     if (!sourceSessionFile) return;
-    let truncatesRedo = false;
+    const id = crypto.randomUUID();
+    const createUnavailablePending = (reason: string): void => {
+      unavailableMessage = reason;
+      pending = {
+        id,
+        startLeafId: ctx.sessionManager.getLeafId(),
+        sourceSessionFile,
+        sourceSessionId: ctx.sessionManager.getSessionId(),
+        before: [],
+        truncatesRedo: false,
+        unavailableReason: reason,
+      };
+    };
+    let recoveryError: string | undefined;
     try {
-      truncatesRedo = (await reconstructState(ctx.sessionManager.getBranch())).redo.length > 0;
+      recoveryError = await ensureRecovered(ctx);
     } catch (error) {
-      unavailableMessage = error instanceof Error ? error.message : String(error);
+      recoveryError = error instanceof Error ? error.message : String(error);
+    }
+    if (recoveryError) {
+      createUnavailablePending(recoveryError);
       return;
     }
-    const id = crypto.randomUUID();
+    let truncatesRedo = false;
+    try {
+      const state = await reconstructState(ctx.sessionManager.getBranch());
+      rootSessionId = lineageFromState(state, ctx.sessionManager.getSessionId());
+      truncatesRedo = state.redo.length > 0;
+    } catch (error) {
+      createUnavailablePending(error instanceof Error ? error.message : String(error));
+      return;
+    }
     try {
       const before = await workspace.capture(
         roots(ctx),
-        rootSessionId || ctx.sessionManager.getSessionId(),
+        rootSessionId,
         id,
         "before",
       );
@@ -306,7 +578,8 @@ export function createUndoRedoExtension(
       };
       unavailableMessage = undefined;
     } catch (error) {
-      unavailableMessage = error instanceof Error ? error.message : String(error);
+      const reason = error instanceof Error ? error.message : String(error);
+      unavailableMessage = reason;
       pending = {
         id,
         startLeafId: ctx.sessionManager.getLeafId(),
@@ -314,21 +587,20 @@ export function createUndoRedoExtension(
         sourceSessionId: ctx.sessionManager.getSessionId(),
         before: [],
         truncatesRedo,
-        unavailableReason: unavailableMessage,
+        unavailableReason: reason,
       };
-      pi.logger.warn("Undo snapshot capture failed", { error: unavailableMessage });
+      pi.logger.warn("Undo snapshot capture failed", { error: reason });
     }
   });
 
   pi.on("agent_end", async (event, ctx) => {
-    lastContext = ctx;
     if (!event.willContinue) await finalizePending(ctx);
   });
 
   const preflight = async (
     ctx: ExtensionCommandContext,
     side: "before" | "after",
-  ): Promise<{ state: ResolvedState; turn: TurnCheckpointV2 } | undefined> => {
+  ): Promise<{ state: ResolvedState; turn: TurnCheckpointV2; lineage: string } | undefined> => {
     if (ctx.mode !== "tui") {
       notifyFailure(ctx, "Undo and redo are available only in an interactive root session.");
       return undefined;
@@ -337,9 +609,10 @@ export function createUndoRedoExtension(
       notifyFailure(ctx, "Cannot change undo history while the session or a relevant subagent is busy.");
       return undefined;
     }
-    let state: ResolvedState;
+    await finalizePending(ctx);
+
     try {
-      const recoveryError = await recoverJournal(ctx);
+      const recoveryError = await ensureRecovered(ctx);
       if (recoveryError) {
         notifyFailure(ctx, recoveryError, true);
         return undefined;
@@ -348,8 +621,10 @@ export function createUndoRedoExtension(
       notifyFailure(ctx, error instanceof Error ? error.message : String(error), true);
       return undefined;
     }
+    let state: ResolvedState;
     try {
       state = await reconstructState(ctx.sessionManager.getBranch());
+      rootSessionId = lineageFromState(state, ctx.sessionManager.getSessionId());
     } catch (error) {
       notifyFailure(ctx, `Undo history is unavailable: ${error instanceof Error ? error.message : String(error)}`);
       return undefined;
@@ -396,7 +671,24 @@ export function createUndoRedoExtension(
       );
       return undefined;
     }
-    return { state, turn };
+    return { state, turn, lineage: rootSessionId };
+  };
+
+  const completeCleanup = async (
+    ctx: ExtensionCommandContext,
+    direction: "undo" | "redo",
+    lineage: string,
+    journal: TransitionJournal,
+  ): Promise<void> => {
+    try {
+      await releaseJournal(lineage, journal);
+    } catch (error) {
+      notifyFailure(
+        ctx,
+        `${direction === "undo" ? "Undo" : "Redo"} completed, but transaction cleanup is pending: ${error instanceof Error ? error.message : String(error)}`,
+        true,
+      );
+    }
   };
 
   const runUndo = async (ctx: ExtensionCommandContext): Promise<void> => {
@@ -407,93 +699,111 @@ export function createUndoRedoExtension(
       ctx.ui.setEditorText(draft);
       return;
     }
-    const { state, turn } = prepared;
-    const originalSessionFile = ctx.sessionManager.getSessionFile();
-    const originalLeafId = ctx.sessionManager.getLeafId();
+    const { turn, lineage } = prepared;
+    const original: SessionPosition = {
+      sessionFile: ctx.sessionManager.getSessionFile() ?? "",
+      leafId: ctx.sessionManager.getLeafId(),
+    };
     const entry = ctx.sessionManager.getEntry(turn.userEntryId);
-    if (!originalSessionFile || !entry || !isUserEntry(entry)) {
+    if (!original.sessionFile || !entry || !isUserEntry(entry)) {
       ctx.ui.setEditorText(draft);
       notifyFailure(ctx, "The transcript boundary for this undo point is missing.");
       return;
     }
     let rollback: WorkspaceSnapshot[] = [];
     let journal: TransitionJournal | undefined;
-    let transitioned = false;
+    let transcriptTransitioned = false;
+    let workspaceRestoreStarted = false;
     try {
       rollback = await workspace.capture(
         roots(ctx),
-        rootSessionId || ctx.sessionManager.getSessionId(),
+        lineage,
         `rollback-${crypto.randomUUID()}`,
         "rollback",
       );
       journal = {
         version: 1,
+        rootSessionId: lineage,
         direction: "undo",
         turnId: turn.id,
-        original: { sessionFile: originalSessionFile, leafId: originalLeafId },
+        original,
         target: null,
         rollback,
         workspaces: turn.workspaces,
         phase: "prepared",
       };
-      await writeJournal(dataDir, rootSessionId || ctx.sessionManager.getSessionId(), journal);
+      await writeJournal(dataDir, lineage, journal);
       const cursor = {
         version: 2 as const,
         kind: "undo" as const,
         turnId: turn.id,
-        source: { sessionFile: originalSessionFile, leafId: originalLeafId } satisfies SessionPosition,
+        source: original,
       };
       if (!entry.parentId) {
         const result = await ctx.newSession({
-          parentSession: originalSessionFile,
+          parentSession: original.sessionFile,
           setup: async (manager) => {
             manager.appendCustomEntry(CURSOR_TYPE, cursor);
             await manager.ensureOnDisk();
           },
         });
         if (result.cancelled) throw new Error("Session transition was cancelled.");
-        transitioned = true;
+        transcriptTransitioned = true;
       } else {
         const result =
           messageRecord(entry)?.role === "user"
             ? await ctx.branch(turn.userEntryId)
             : await ctx.navigateTree(entry.parentId, { summarize: false });
         if (result.cancelled) throw new Error("Session branching was cancelled.");
-        transitioned = true;
-        pi.appendEntry(CURSOR_TYPE, cursor);
+        transcriptTransitioned = true;
+        await appendDurably(ctx, CURSOR_TYPE, cursor);
       }
-      journal = {
-        ...journal,
-        target: {
-          sessionFile: ctx.sessionManager.getSessionFile() ?? "",
-          leafId: ctx.sessionManager.getLeafId(),
-        },
-        phase: "transcript-moved",
+      const target: SessionPosition = {
+        sessionFile: ctx.sessionManager.getSessionFile() ?? "",
+        leafId: ctx.sessionManager.getLeafId(),
       };
-      await writeJournal(dataDir, rootSessionId || ctx.sessionManager.getSessionId(), journal);
+      if (!target.sessionFile) throw new Error("Undo target session is missing.");
+      journal = { ...journal, target, phase: "transcript-moved" };
+      await writeJournal(dataDir, lineage, journal);
+      workspaceRestoreStarted = true;
       await workspace.restoreAllPaths(turn.workspaces, "before");
       journal = { ...journal, phase: "workspace-restored" };
-      await writeJournal(dataDir, rootSessionId || ctx.sessionManager.getSessionId(), journal);
+      await writeJournal(dataDir, lineage, journal);
       await ctx.reload();
       const prompt = userText(entry);
       ctx.ui.setEditorText(prompt.text);
       ctx.ui.notify("Undid last user turn and restored selected workspace paths.", "info");
       if (prompt.attachments) ctx.ui.notify("Prompt attachments cannot be restored to the editor.", "warning");
       ctx.ui.notify(SCOPE_WARNING, "warning");
-      await workspace.deleteRefs(rollback);
-      await clearJournal(dataDir, rootSessionId || ctx.sessionManager.getSessionId());
+      excludedPathsNotice(ctx, turn);
     } catch (error) {
-      await restoreRollback(workspace, rollback, turn).catch((compensation: unknown) =>
-        pi.logger.error("Undo workspace compensation failed", { error: String(compensation) }),
+      const compensationError = await compensate(
+        ctx,
+        "undo",
+        original,
+        rollback,
+        turn,
+        workspaceRestoreStarted,
+        transcriptTransitioned,
       );
-      if (transitioned) {
-        await ctx.switchSession(originalSessionFile).catch((compensation: unknown) =>
-          pi.logger.error("Undo transcript compensation failed", { error: String(compensation) }),
+      if (!compensationError && journal) {
+        const recoveryError = await recoverJournal(ctx, lineage, journal).catch(
+          (recovery) => recovery instanceof Error ? recovery.message : String(recovery),
         );
+        if (recoveryError) {
+          ctx.ui.setEditorText(draft);
+          notifyFailure(ctx, `Failed to undo last user turn: ${error instanceof Error ? error.message : String(error)}. Manual recovery is required: ${recoveryError}`, true);
+          return;
+        }
       }
       ctx.ui.setEditorText(draft);
-      notifyFailure(ctx, `Failed to undo last user turn: ${error instanceof Error ? error.message : String(error)}`, true);
+      const manualRecovery = compensationError
+        ? ` Manual recovery is required: ${compensationError}`
+        : "";
+      notifyFailure(ctx, `Failed to undo last user turn: ${error instanceof Error ? error.message : String(error)}.${manualRecovery}`, true);
+      return;
     }
+    if (journal) await completeCleanup(ctx, "undo", lineage, journal);
   };
 
   const runRedo = async (ctx: ExtensionCommandContext): Promise<void> => {
@@ -504,68 +814,89 @@ export function createUndoRedoExtension(
       ctx.ui.setEditorText(draft);
       return;
     }
-    const { state, turn } = prepared;
+    const { state, turn, lineage } = prepared;
     const target = state.redo.at(-1)?.target;
-    const originalSessionFile = ctx.sessionManager.getSessionFile();
-    const originalLeafId = ctx.sessionManager.getLeafId();
-    if (!target || !originalSessionFile) {
+    const original: SessionPosition = {
+      sessionFile: ctx.sessionManager.getSessionFile() ?? "",
+      leafId: ctx.sessionManager.getLeafId(),
+    };
+    if (!target || !original.sessionFile) {
       ctx.ui.setEditorText(draft);
       notifyFailure(ctx, "The transcript position for this redo point is missing.");
       return;
     }
     let rollback: WorkspaceSnapshot[] = [];
     let journal: TransitionJournal | undefined;
-    let transitioned = false;
+    let transcriptTransitioned = false;
+    let workspaceRestoreStarted = false;
     try {
       rollback = await workspace.capture(
         roots(ctx),
-        rootSessionId || ctx.sessionManager.getSessionId(),
+        lineage,
         `rollback-${crypto.randomUUID()}`,
         "rollback",
       );
       journal = {
         version: 1,
+        rootSessionId: lineage,
         direction: "redo",
         turnId: turn.id,
-        original: { sessionFile: originalSessionFile, leafId: originalLeafId },
+        original,
         target,
         rollback,
         workspaces: turn.workspaces,
         phase: "prepared",
       };
-      await writeJournal(dataDir, rootSessionId || ctx.sessionManager.getSessionId(), journal);
-      const result = await ctx.switchSession(target.sessionFile);
-      if (result.cancelled) throw new Error("Source session switch was cancelled.");
-      if (
-        target.leafId !== null &&
-        ctx.sessionManager.getLeafId() !== target.leafId
-      ) {
-        throw new Error("Redo source session is not at its recorded transcript leaf.");
+      await writeJournal(dataDir, lineage, journal);
+      await moveToPosition(ctx, target, () => {
+        transcriptTransitioned = true;
+      });
+      const targetState = await reconstructState(ctx.sessionManager.getBranch());
+      if (!compatibleRedoState(state, targetState, turn)) {
+        throw new Error("Redo target does not contain the recorded next undo state.");
       }
-      transitioned = true;
       journal = { ...journal, phase: "transcript-moved" };
-      await writeJournal(dataDir, rootSessionId || ctx.sessionManager.getSessionId(), journal);
+      await writeJournal(dataDir, lineage, journal);
+      workspaceRestoreStarted = true;
       await workspace.restoreAllPaths(turn.workspaces, "after");
       journal = { ...journal, phase: "workspace-restored" };
-      await writeJournal(dataDir, rootSessionId || ctx.sessionManager.getSessionId(), journal);
+      await writeJournal(dataDir, lineage, journal);
       await ctx.reload();
+      await moveToPosition(ctx, target, () => {
+        transcriptTransitioned = true;
+      });
       if (state.redo.length > 1) ctx.ui.setEditorText(draft);
       ctx.ui.notify("Redid user turn and restored selected workspace paths.", "info");
       ctx.ui.notify(SCOPE_WARNING, "warning");
-      await workspace.deleteRefs(rollback);
-      await clearJournal(dataDir, rootSessionId || ctx.sessionManager.getSessionId());
+      excludedPathsNotice(ctx, turn);
     } catch (error) {
-      await restoreRollback(workspace, rollback, turn).catch((compensation: unknown) =>
-        pi.logger.error("Redo workspace compensation failed", { error: String(compensation) }),
+      const compensationError = await compensate(
+        ctx,
+        "redo",
+        original,
+        rollback,
+        turn,
+        workspaceRestoreStarted,
+        transcriptTransitioned,
       );
-      if (transitioned) {
-        await ctx.switchSession(originalSessionFile).catch((compensation: unknown) =>
-          pi.logger.error("Redo transcript compensation failed", { error: String(compensation) }),
+      if (!compensationError && journal) {
+        const recoveryError = await recoverJournal(ctx, lineage, journal).catch(
+          (recovery) => recovery instanceof Error ? recovery.message : String(recovery),
         );
+        if (recoveryError) {
+          ctx.ui.setEditorText(draft);
+          notifyFailure(ctx, `Failed to redo user turn: ${error instanceof Error ? error.message : String(error)}. Manual recovery is required: ${recoveryError}`, true);
+          return;
+        }
       }
       ctx.ui.setEditorText(draft);
-      notifyFailure(ctx, `Failed to redo user turn: ${error instanceof Error ? error.message : String(error)}`, true);
+      const manualRecovery = compensationError
+        ? ` Manual recovery is required: ${compensationError}`
+        : "";
+      notifyFailure(ctx, `Failed to redo user turn: ${error instanceof Error ? error.message : String(error)}.${manualRecovery}`, true);
+      return;
     }
+    if (journal) await completeCleanup(ctx, "redo", lineage, journal);
   };
 
   pi.registerCommand("undo", {

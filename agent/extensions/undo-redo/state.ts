@@ -59,70 +59,176 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function isSnapshot(value: unknown): value is WorkspaceSnapshot {
-  const snapshot = record(value);
-  return !!snapshot &&
-    typeof snapshot.repositoryRoot === "string" &&
-    typeof snapshot.commonDir === "string" &&
-    typeof snapshot.head === "string" &&
-    typeof snapshot.indexTree === "string" &&
-    typeof snapshot.worktreeTree === "string" &&
-    typeof snapshot.refName === "string" &&
-    Array.isArray(snapshot.scopes) &&
-    snapshot.scopes.every((scope) => typeof scope === "string") &&
-    Array.isArray(snapshot.excludedPaths) &&
-    snapshot.excludedPaths.every((entry) => typeof entry === "string");
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).every((key) => keys.includes(key)) &&
+    keys.every((key) => key in value);
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && !value.includes("\0");
 }
 
 function validPath(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 &&
-    !value.startsWith("/") && !value.split("/").includes("..");
+  return nonEmptyString(value) &&
+    value !== "." &&
+    !value.startsWith("/") &&
+    !value.split("/").includes("..");
+}
+
+function validScope(value: unknown): value is string {
+  return value === "." || validPath(value);
+}
+
+function validSnapshotRef(value: unknown): value is string {
+  return nonEmptyString(value) &&
+    value.startsWith("refs/omp/undo/") &&
+    !value.includes("..") &&
+    !value.endsWith("/") &&
+    /^refs\/[A-Za-z0-9._/-]+$/.test(value);
+}
+
+function containedByScope(relativePath: string, scopes: readonly string[]): boolean {
+  return scopes.some(
+    (scope) =>
+      scope === "." || relativePath === scope || relativePath.startsWith(`${scope}/`),
+  );
+}
+
+function stringList(
+  value: unknown,
+  validElement: (entry: unknown) => entry is string,
+): value is string[] {
+  return Array.isArray(value) && value.every(validElement);
+}
+
+function samePaths(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((path, index) => path === right[index]);
+}
+
+function uniquePaths(paths: readonly string[]): boolean {
+  return new Set(paths).size === paths.length;
+}
+
+export function workspaceIdentity(
+  workspace: Pick<WorkspaceDelta, "repositoryRoot" | "commonDir">,
+): string {
+  return `${workspace.repositoryRoot}\0${workspace.commonDir}`;
+}
+
+export function isWorkspaceSnapshot(value: unknown): value is WorkspaceSnapshot {
+  const snapshot = record(value);
+  if (!snapshot) return false;
+  const scopes = snapshot.scopes;
+  const excludedPaths = snapshot.excludedPaths;
+  if (
+    !exactKeys(snapshot, [
+      "repositoryRoot",
+      "commonDir",
+      "head",
+      "indexTree",
+      "worktreeTree",
+      "refName",
+      "scopes",
+      "excludedPaths",
+    ]) ||
+    !nonEmptyString(snapshot.repositoryRoot) ||
+    !nonEmptyString(snapshot.commonDir) ||
+    !nonEmptyString(snapshot.head) ||
+    !nonEmptyString(snapshot.indexTree) ||
+    !nonEmptyString(snapshot.worktreeTree) ||
+    !validSnapshotRef(snapshot.refName) ||
+    !stringList(scopes, validScope) ||
+    !uniquePaths(scopes) ||
+    !stringList(excludedPaths, validPath) ||
+    !uniquePaths(excludedPaths)
+  ) return false;
+  return excludedPaths.every((excludedPath) =>
+    containedByScope(excludedPath, scopes));
+}
+
+export function isWorkspaceDelta(value: unknown): value is WorkspaceDelta {
+  const workspace = record(value);
+  if (
+    !workspace ||
+    !exactKeys(workspace, [
+      "repositoryRoot",
+      "commonDir",
+      "before",
+      "after",
+      "changedPaths",
+    ]) ||
+    !nonEmptyString(workspace.repositoryRoot) ||
+    !nonEmptyString(workspace.commonDir) ||
+    !isWorkspaceSnapshot(workspace.before) ||
+    !isWorkspaceSnapshot(workspace.after) ||
+    !Array.isArray(workspace.changedPaths) ||
+    !workspace.changedPaths.every(validPath) ||
+    !uniquePaths(workspace.changedPaths)
+  ) return false;
+  const before = workspace.before;
+  const after = workspace.after;
+  if (
+    before.repositoryRoot !== workspace.repositoryRoot ||
+    before.commonDir !== workspace.commonDir ||
+    after.repositoryRoot !== workspace.repositoryRoot ||
+    after.commonDir !== workspace.commonDir ||
+    !samePaths(before.scopes, after.scopes)
+  ) return false;
+  const excludedPaths = new Set([...before.excludedPaths, ...after.excludedPaths]);
+  return workspace.changedPaths.every(
+    (changedPath) =>
+      !excludedPaths.has(changedPath) &&
+      containedByScope(changedPath, after.scopes),
+  );
+}
+
+export function isSessionPosition(value: unknown): value is SessionPosition {
+  const position = record(value);
+  return !!position &&
+    exactKeys(position, ["sessionFile", "leafId"]) &&
+    nonEmptyString(position.sessionFile) &&
+    (nonEmptyString(position.leafId) || position.leafId === null);
 }
 
 export function isCheckpoint(value: unknown): value is TurnCheckpointV2 {
   const checkpoint = record(value);
   if (
     !checkpoint ||
+    !exactKeys(checkpoint, [
+      "version",
+      "id",
+      "rootSessionId",
+      "userEntryId",
+      "sessionFile",
+      "sessionId",
+      "createdAt",
+      "workspaces",
+    ]) ||
     checkpoint.version !== 2 ||
-    typeof checkpoint.id !== "string" ||
-    typeof checkpoint.rootSessionId !== "string" ||
-    typeof checkpoint.userEntryId !== "string" ||
-    typeof checkpoint.sessionFile !== "string" ||
-    typeof checkpoint.sessionId !== "string" ||
-    typeof checkpoint.createdAt !== "string" ||
-    !Array.isArray(checkpoint.workspaces)
+    !nonEmptyString(checkpoint.id) ||
+    !nonEmptyString(checkpoint.rootSessionId) ||
+    !nonEmptyString(checkpoint.userEntryId) ||
+    !nonEmptyString(checkpoint.sessionFile) ||
+    !nonEmptyString(checkpoint.sessionId) ||
+    !nonEmptyString(checkpoint.createdAt) ||
+    !Number.isFinite(Date.parse(checkpoint.createdAt)) ||
+    !Array.isArray(checkpoint.workspaces) ||
+    !checkpoint.workspaces.every(isWorkspaceDelta)
   ) return false;
-  return checkpoint.workspaces.every((value) => {
-    const workspace = record(value);
-    if (
-      !workspace ||
-      typeof workspace.repositoryRoot !== "string" ||
-      typeof workspace.commonDir !== "string" ||
-      !isSnapshot(workspace.before) ||
-      !isSnapshot(workspace.after) ||
-      !Array.isArray(workspace.changedPaths) ||
-      !workspace.changedPaths.every(validPath)
-    ) return false;
-    const scopes = (workspace.after as WorkspaceSnapshot).scopes;
-    return workspace.changedPaths.every(
-      (changedPath) =>
-        scopes.some(
-          (scope) =>
-            scope === "." || changedPath === scope || changedPath.startsWith(`${scope}/`),
-        ),
-    );
-  });
+  const identities = checkpoint.workspaces.map(workspaceIdentity);
+  return uniquePaths(identities);
 }
 
 export function isCursorEvent(value: unknown): value is CursorEventV2 {
   const cursor = record(value);
   if (!cursor || cursor.version !== 2 || typeof cursor.kind !== "string") return false;
-  if (cursor.kind === "truncate") return Object.keys(cursor).every((key) =>
-    ["version", "kind"].includes(key));
-  const source = record(cursor.source);
-  return cursor.kind === "undo" && typeof cursor.turnId === "string" &&
-    !!source && typeof source.sessionFile === "string" &&
-    (typeof source.leafId === "string" || source.leafId === null);
+  if (cursor.kind === "truncate") {
+    return exactKeys(cursor, ["version", "kind"]);
+  }
+  return cursor.kind === "undo" &&
+    exactKeys(cursor, ["version", "kind", "turnId", "source"]) &&
+    nonEmptyString(cursor.turnId) &&
+    isSessionPosition(cursor.source);
 }
 function cloneState(state?: ResolvedState): ResolvedState {
   return state
@@ -137,7 +243,7 @@ function cloneState(state?: ResolvedState): ResolvedState {
 
 function updateHeads(state: ResolvedState, turn: TurnCheckpointV2): void {
   for (const workspace of turn.workspaces) {
-    state.expectedHeads.set(workspace.commonDir, workspace.after.head);
+    state.expectedHeads.set(workspaceIdentity(workspace), workspace.after.head);
   }
 }
 
@@ -173,6 +279,9 @@ function entriesToLeaf(
 export type PositionLoader = (position: SessionPosition) => Promise<readonly SessionEntry[]>;
 
 export async function loadPosition(position: SessionPosition): Promise<readonly SessionEntry[]> {
+  if (!isSessionPosition(position)) {
+    throw new StateReconstructionError("Malformed persisted session position.");
+  }
   if (!(await Bun.file(position.sessionFile).exists())) {
     throw new StateReconstructionError(`Persisted session is missing: ${position.sessionFile}`);
   }
