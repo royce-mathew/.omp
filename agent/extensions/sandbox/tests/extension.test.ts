@@ -112,6 +112,7 @@ test("hides OMP tools that bypass the sandbox and restores only removed tools", 
     "python",
     "notebook",
     "inspect_image",
+    "eval",
     "custom",
   ];
   const visibility = createHostToolVisibility({
@@ -138,11 +139,12 @@ test("hides OMP tools that bypass the sandbox and restores only removed tools", 
     "python",
     "notebook",
     "inspect_image",
+    "eval",
   ]);
 });
 
 test("tool-call backstop covers every hidden OMP tool", () => {
-  const hidden = ["grep", "glob", "lsp", "python", "notebook", "inspect_image"];
+  const hidden = ["grep", "glob", "lsp", "python", "notebook", "inspect_image", "eval"];
   const tools = ["bash", "read", "write", "edit", ...hidden, "custom"];
   const unavailable = "Sandbox unavailable; command blocked";
   const readyBlocked = tools.filter((tool) => sandboxToolBlockReason(tool, true, unavailable));
@@ -151,6 +153,58 @@ test("tool-call backstop covers every hidden OMP tool", () => {
   expect(readyBlocked).toEqual(hidden);
   expect(failedBlocked).toEqual(["bash", ...hidden]);
   expect(sandboxToolBlockReason("custom", true, unavailable)).toBeUndefined();
+});
+
+test("blocks eval tool execution while sandboxing is active", async () => {
+  const coordinator = new SandboxCoordinator(
+    "/root",
+    new FakeRuntime(),
+    async () => ({ ...DEFAULT_CONFIG, enabled: true }),
+  );
+  const harness = extensionHarness();
+  const session = registerSandboxExtension(harness.api, coordinator);
+  const notifications: string[] = [];
+  const ctx = context("eval-tool", notifications);
+
+  await harness.handler("session_start")({ type: "session_start" }, ctx);
+  const result = await harness.handler("tool_call")(
+    { toolName: "eval", input: { language: "py", code: "open('/home/royce/.bashrc').read()" } },
+    ctx,
+  );
+
+  expect(session.ready).toBe(true);
+  expect(result).toEqual({
+    block: true,
+    reason: "The eval tool bypasses the OS sandbox and is unavailable while sandboxing is enabled. Use sandboxed bash instead.",
+  });
+});
+
+test("blocks eval Python execution while sandboxing is active", async () => {
+  const coordinator = new SandboxCoordinator(
+    "/root",
+    new FakeRuntime(),
+    async () => ({ ...DEFAULT_CONFIG, enabled: true }),
+  );
+  const harness = extensionHarness();
+  const session = registerSandboxExtension(harness.api, coordinator);
+  const notifications: string[] = [];
+  const ctx = context("eval", notifications);
+
+  await harness.handler("session_start")({ type: "session_start" }, ctx);
+  const result = await harness.handler("user_python")(
+    { type: "user_python", code: "raise RuntimeError('must not run')", cwd: ctx.cwd },
+    ctx,
+  );
+
+  expect(session.ready).toBe(true);
+  expect(result).toMatchObject({
+    result: {
+      output: "Python execution is unavailable while sandboxing is enabled. Use sandboxed bash.",
+      exitCode: 1,
+      displayOutputs: [],
+      stdinRequested: false,
+    },
+  });
 });
 
 test("main commands transition every participant and reject busy transitions atomically", async () => {

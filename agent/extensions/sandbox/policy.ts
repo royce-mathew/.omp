@@ -15,6 +15,7 @@ const HOST_FILESYSTEM_TOOLS: Record<string, true> = {
   glob: true,
   grep: true,
   inspect_image: true,
+  eval: true,
   lsp: true,
   notebook: true,
   python: true,
