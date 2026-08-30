@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   SandboxManager,
@@ -23,7 +25,20 @@ export interface EffectiveAllowances {
 }
 
 const unique = (values: string[]): string[] => [...new Set(values)];
-const RUNTIME_SUPPORT_PATHS = [process.execPath];
+
+function runtimeSupportPaths(): string[] {
+  const paths = [process.execPath];
+  if (process.platform !== "linux" || (process.arch !== "x64" && process.arch !== "arm64")) {
+    return paths;
+  }
+  const runtimeEntry = fileURLToPath(import.meta.resolve("@anthropic-ai/sandbox-runtime"));
+  return [
+    ...paths,
+    join(dirname(runtimeEntry), "..", "vendor", "seccomp", process.arch, "apply-seccomp"),
+  ];
+}
+
+const RUNTIME_SUPPORT_PATHS = runtimeSupportPaths();
 
 export function resolveAllowances(
   config: SandboxConfig,

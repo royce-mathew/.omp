@@ -1,3 +1,5 @@
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
 
 import { DEFAULT_CONFIG } from "../config.ts";
@@ -42,6 +44,21 @@ describe("sandbox runtime adapter", () => {
     expect(config.filesystem?.denyWrite).toContain("/workspace/.pi");
     expect(config).not.toHaveProperty("enabled");
     expect(config).not.toHaveProperty("permissionPromptTimeoutSeconds");
+  });
+
+  test("allows the Linux seccomp helper outside the sandbox working directory", () => {
+    const runtimeEntry = fileURLToPath(import.meta.resolve("@anthropic-ai/sandbox-runtime"));
+    const seccompHelper = join(
+      dirname(runtimeEntry),
+      "..",
+      "vendor",
+      "seccomp",
+      process.arch,
+      "apply-seccomp",
+    );
+    const config = buildRuntimeConfig(DEFAULT_CONFIG, "/workspace");
+
+    expect(config.filesystem?.allowRead).toContain(seccompHelper);
   });
 
   test("rejects unsupported Linux filesystem globs instead of weakening policy", () => {
