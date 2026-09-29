@@ -12,6 +12,7 @@ auth-*.token
 agent/sessions/
 agent/terminal-sessions/
 agent/cache/
+agent/blobs/
 agent/*.db
 agent/*.db-*
 agent/*.db-shm
@@ -22,6 +23,7 @@ agent/sandbox.*
 logs/
 run/
 cache/
+webcache/
 collab/
 wt/
 install-id
